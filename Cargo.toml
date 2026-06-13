@@ -1,5 +1,5 @@
 [package]
-name = "mini-kv"
+name = "stupid-kv"
 edition = "2021"
 version = "0.18.1"
 

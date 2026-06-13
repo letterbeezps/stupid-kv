@@ -1,8 +1,8 @@
-# Mini-KV 教程：第一节 — 实现一个支持 MVCC 的基本 KV 数据库
+# Stupid-KV 教程：第一节 — 实现一个支持 MVCC 的基本 KV 数据库
 
 ## 1. 概述
 
-Mini-KV 是一个纯内存的键值数据库，核心特性是基于 **MVCC（Multi-Version Concurrency Control，多版本并发控制）** 实现的事务隔离。它通过维护每个 key 的多个版本数据，使读操作无需加锁，写操作在提交时通过乐观冲突检测来确保隔离性。
+Stupid-KV 是一个纯内存的键值数据库，核心特性是基于 **MVCC（Multi-Version Concurrency Control，多版本并发控制）** 实现的事务隔离。它通过维护每个 key 的多个版本数据，使读操作无需加锁，写操作在提交时通过乐观冲突检测来确保隔离性。
 
 **关键设计目标：**
 
@@ -426,7 +426,7 @@ impl Transaction {
 参考 `examples/basic.rs`：
 
 ```rust
-use mini_kv::Database;
+use stupid_kv::Database;
 
 fn main() {
     let db = Database::new();

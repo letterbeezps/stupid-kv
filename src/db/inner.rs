@@ -8,7 +8,7 @@ use crate::{oracle::Oracle, queue::{Commit, Merge}, versions::Versions};
 
 
 
-/// Mini-KV 核心存储引擎内部结构体
+/// Stupid-KV 核心存储引擎内部结构体
 /// 
 /// # 事务提交流程
 /// ```markdown

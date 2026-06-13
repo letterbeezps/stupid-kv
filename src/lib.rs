@@ -1,4 +1,4 @@
-pub const LOG_TARGET_CONFLICTS: &str = "mini-kv::conflicts";
+pub const LOG_TARGET_CONFLICTS: &str = "stupid-kv::conflicts";
 
 mod db;
 mod tx;

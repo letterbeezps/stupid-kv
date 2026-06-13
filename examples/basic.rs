@@ -1,4 +1,4 @@
-use mini_kv::Database;
+use stupid_kv::Database;
 
 fn main() {
     let db = Database::new();
