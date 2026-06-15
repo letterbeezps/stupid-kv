@@ -14,7 +14,7 @@
 
 | Tag | 章节 | 说明 |
 |-----|------|------|
-| [`0.0.1`](https://github.com/1token/stupid-kv/tree/0.0.1) | Section 0.0.1 — 基本 MVCC 事务 | 纯内存 KV，MVCC 多版本并发控制，快照隔离，写-写冲突检测 |
+| [`0.0.1`](https://github.com/letterbeezps/stupid-kv/tree/0.0.1) | Section 0.0.1 — 基本 MVCC 事务 | 纯内存 KV，MVCC 多版本并发控制，快照隔离，写-写冲突检测 |
 
 详细设计文档：[docs/001_basic_transaction.md](docs/001_basic_transaction.md)
 
