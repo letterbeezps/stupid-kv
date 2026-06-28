@@ -15,40 +15,22 @@ Stupid-KV 是一个纯内存的键值数据库，核心特性是基于 **MVCC（
 
 ## 2. 整体架构
 
-```
-                                 ┌────────────────────────────────────────────────┐
-                                 │                 Database                       │
-                                 │  ┌────────────────────┐                        │
-                                 │  │       Oracle       │  -- global timestamp   │
-                                 │  └────────────────────┘                        │
-                                 │                                                │
-                                 │  ┌──────────────────────┐                      │
-                                 │  │ transaction_commit_id│ -- commit seq id     │
-                                 │  └──────────────────────┘                      │
-                                 │  ┌────────────────────────┐                    │
-                                 │  │transaction_commit_queue│ -- commit queue    │
-                                 │  └────────────────────────┘                    │
-                                 │  ┌──────────────────────┐                      │
-                                 │  │ transaction_merge_id │ -- merge seq id      │
-                                 │  └──────────────────────┘                      │
-                                 │  ┌────────────────────────┐                    │
-                                 │  │transaction_merge_queue │ -- merge queue     │
-                                 │  └────────────────────────┘                    │
-                                 │  ┌──────────────┐                              │
-                                 │  │   datastore  │  -- Key -> RwLock<Versions>  │
-                                 │  └──────────────┘                              │
-                                 └────────────────────────────────────────────────┘
-                                                     ▲
-                                                     │ shared reference
-                    ┌────────────────────────────────┼──────────────────────────────┐
-                    │                                │                              │
-                    ▼                                ▼                              ▼
-        ┌─────────────────────────┐      ┌───────────────────────┐      ┌───────────────────────┐
-        │ Transaction 1 (write)   │      │ Transaction 2 (write) │      │ Transaction 3 (read)  │
-        │  commit: 0 (snapshot)   │      │  commit: 0 (snapshot) │      │  commit: N (snapshot) │
-        │  version: T1            │      │  version: T2          │      │  version: T3          │
-        │  writeset: {...}        │      │  writeset: {...}      │      │  (no writes)          │
-        └─────────────────────────┘      └───────────────────────┘      └───────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Database["Database"]
+        Oracle["Oracle global timestamp"]
+        TCI["transaction_commit_id commit seq id"]
+        TCQ["transaction_commit_queue commit queue"]
+        TMI["transaction_merge_id merge seq id"]
+        TMQ["transaction_merge_queue merge queue"]
+        DS["datastore Key -&gt; RwLock&lt;Versions&gt;"]
+    end
+    Database -->|shared reference| T1
+    Database -->|shared reference| T2
+    Database -->|shared reference| T3
+    T1["Transaction 1 (write)<br/>commit: 0 (snapshot)<br/>version: T1<br/>writeset: {...}"]
+    T2["Transaction 2 (write)<br/>commit: 0 (snapshot)<br/>version: T2<br/>writeset: {...}"]
+    T3["Transaction 3 (read)<br/>commit: N (snapshot)<br/>version: T3<br/>(no writes)"]
 ```
 
 ---
@@ -116,62 +98,32 @@ Oracle 是一个单调递增的全局时钟，用于生成版本号：
 
 ### 4.1 事务生命周期
 
-```
-      ┌────────────────────┐
-      │ Create Transaction │  <-- db.transaction(write)
-      └──────────┬─────────┘
-                 │
-                 ▼
-      ┌──────────────────┐
-      │  Read / Write    │  <-- tx.get() / tx.set() / tx.del()
-      └──────────┬───────┘
-                 │ writeset accumulates local changes
-                 ▼
-      ┌──────────────────┐
-      │  Commit Tx       │  <-- tx.commit()
-      └──────────┬───────┘
-                 │
-                 ▼
-      ┌────────────────────────────┐
-      │ 1. auto_commit to queue    │  <-- allocate commit id
-      └──────────┬─────────────────┘
-                 │
-                 ▼
-     ┌────────────────────────────────────┐
-     │ 2. scan [commit+1, version) range  │  <-- detect write conflict
-     └──────────┬─────────────────────────┘
-                │ conflict  -> KeyWriteConflict
-                │ no conflict -> continue
-                ▼
-    ┌──────────────────────────────┐
-    │ 3. atomic_merge to queue     │  <-- allocate data version
-    └────────────┬─────────────────┘
-                 │
-                 ▼
-   ┌───────────────────────────────┐
-   │ 4. write to datastore         │  <-- append new Version per key
-   └─────────────┬─────────────────┘
-                 │
-                 ▼
-   ┌────────────────────────────┐
-   │ 5. remove from merge queue │  <-- cleanup temp records
-   └────────────────────────────┘
+```mermaid
+flowchart TD
+    A["Create Transaction<br/>db.transaction(write)"] --> B["Read / Write<br/>tx.get() / tx.set() / tx.del()"]
+    B -->|writeset accumulates local changes| C["Commit Tx<br/>tx.commit()"]
+    C --> D["auto_commit to queue<br/>allocate commit id"]
+    D --> E["scan [commit+1, version) range<br/>detect write conflict"]
+    E -->|conflict| F["KeyWriteConflict"]
+    E -->|no conflict| G["atomic_merge to queue<br/>allocate data version"]
+    G --> H["write to datastore<br/>append new Version per key"]
+    H --> I["remove from merge queue<br/>cleanup temp records"]
 ```
 
 ### 4.2 读取路径
 
 读操作遵循以下优先级：
 
-```
-读取请求 (key, version)
-    │
-    ├─► 【写事务专属】检查本事务 writeset ──► 命中则返回
-    │
-    ├─► 检查 transaction_merge_queue (从新到旧, version ≤ 版本)
-    │        └─► 命中则返回（确保看到正在合并中的数据）
-    │
-    └─► 检查 datastore 中的 Versions 列表
-             └─► 找到 ≤ version 的最大版本对应的值
+```mermaid
+flowchart TD
+    Start["Read request (key, version)"] --> Q1{"Write transaction?"}
+    Q1 -->|Yes| W["Check own writeset"]
+    Q1 -->|No| M["Check transaction_merge_queue<br/>(newest to oldest, entry version &lt;= query version)"]
+    W -->|hit| R1["Return"]
+    W -->|miss| M
+    M -->|hit| R2["Return (see merging data)"]
+    M -->|miss| D["Check Versions list in datastore<br/>find largest version &lt;= query version"]
+    D --> R3["Return value"]
 ```
 
 **关键代码 `src/tx/transaction_inner.rs:318-348`：**
@@ -317,7 +269,7 @@ fn auto_commit(&self, updates: Commit) -> (u64, Arc<Commit>) {
 
 ### T2 时刻：事务执行
 
-```
+``` shell
 tx1.set("key1", "v1")  → writeset = {"key1": Some("v1")}
 tx2.set("key1", "v2")  → writeset = {"key1": Some("v2")}
 tx3.get("key1")         → None（datastore 中无 key1）
@@ -351,7 +303,7 @@ tx3.get("key1")         → None（datastore 中无 key1）
 
 ### T5 时刻：tx3 读取
 
-```
+``` shell
 tx3.get("key1") → 查找 ≤ T1 的版本 → 找到 T_merge1 > T1？不，T_merge1 > T1，
 ```
 
@@ -465,32 +417,24 @@ fn main() {
 
 ## 11. 模块依赖图
 
-```
-                     ┌─────────────┐
-                     │    error    │  -- error type definitions
-                     └──────┬──────┘
-                            │
-┌──────────┐       ┌────────▼────────┐        ┌──────────┐
-│    kv    │<------│       tx        │<-------│  oracle  │
-└────┬─────┘       └────────┬────────┘        └────┬─────┘
-     │                      │                      │
-     │                      ▼                      │
-     │              ┌─────────────┐                │
-     │              │    queue    │  -- commit/merge structs
-     │              └──────┬──────┘                │
-     │                     │                       │
-     │                     ▼                       │
-     │              ┌──────────────┐               │
-     └─────────────>│   versions   │<──────────────┘
-                    └──────┬───────┘
-                           │
-                           ▼
-                    ┌──────────────┐
-                    │      db      │  -- Database + Inner
-                    └──────────────┘
-                           │
-                           ▼
-                    ┌──────────────┐
-                    │     lib      │  -- public API exports
-                    └──────────────┘
+```mermaid
+flowchart TD
+    error["error<br/> error type definitions"]
+    kv["kv"]
+    oracle["oracle"]
+    tx["tx"]
+    queue["queue<br/> commit/merge structs"]
+    versions["versions"]
+    db["db<br/> Database + Inner"]
+    lib["lib<br/> public API exports"]
+
+    error --> tx
+    kv --> tx
+    oracle --> tx
+    tx --> queue
+    kv --> versions
+    oracle --> versions
+    queue --> versions
+    versions --> db
+    db --> lib
 ```
