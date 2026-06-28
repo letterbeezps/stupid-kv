@@ -431,10 +431,8 @@ flowchart TD
     error --> tx
     kv --> tx
     oracle --> tx
-    tx --> queue
-    kv --> versions
-    oracle --> versions
-    queue --> versions
-    versions --> db
+    queue --> tx
+    versions --> tx
+    tx --> db
     db --> lib
 ```
