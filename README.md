@@ -1,29 +1,33 @@
 # stupid-kv
 
-一个用 **Rust** 实现的键值数据库教程项目。通过从零开始逐步构建一个支持 **MVCC（Multi-Version Concurrency Control）** 的 KV 数据库，深入理解数据库内核的核心概念。
+一个 **Rust** 学习者在探索数据库内核过程中的小练习。通过参考优秀的开源项目 [`surrealdb/surrealmx`](https://github.com/surrealdb/surrealmx)，尝试从零开始实现一个支持 **MVCC（Multi-Version Concurrency Control）** 的 KV 数据库，以加深对数据库核心概念的理解。
 
 ## 项目简介
 
-本项目参考学习自 [`surrealdb/surrealmx`](https://github.com/surrealdb/surrealmx)，在其设计基础上进行简化和教学化实现，便于学习数据库内核开发。
+本项目**完全参考学习**自 [`surrealdb/surrealmx`](https://github.com/surrealdb/surrealmx)。surrealmx 是一个非常出色的数据库内核实现，我在学习过程中借鉴了它的设计思路，并尝试用自己的方式实现出来。
 
-## 实现进度
+这是一个**纯学习性质**的项目，代码质量和实现细节可能存在很多不足，仅供学习研究使用。如果你也对数据库内核感兴趣，欢迎一起交流讨论！
 
-每一节对应一个 git tag，可通过 `git checkout <tag>` 查看对应版本的代码。
+## 学习进度
 
-### 已完成
+我会把学习过程中的每一个阶段做成一个教程，每一节对应一个 git tag，可以通过 `git checkout <tag>` 查看对应版本的代码。
 
-| Tag | 章节 | 说明 |
-|-----|------|------|
+### 已完成的学习内容
+
+| Tag | 章节 | 学习内容 |
+|-----|------|----------|
 | [`0.0.1`](https://github.com/letterbeezps/stupid-kv/tree/0.0.1) | Section 0.0.1 — 基本 MVCC 事务 | 纯内存 KV，MVCC 多版本并发控制，快照隔离，写-写冲突检测 |
 
-详细设计文档：[docs/001_basic_transaction.md](docs/001_basic_transaction.md)
+详细笔记：[docs/001_basic_transaction.md](docs/001_basic_transaction.md)
 
-### 后续规划
+### 计划学习的内容
+
+这些是我接下来想学习的内容，进度可能会比较慢，也可能随时调整：
 
 - **GC** — 历史版本清理，提交队列清理
 - **持久化** — WAL / Snapshot 持久化到磁盘
 - **SSI** — Serializable Snapshot Isolation
-- ...以及更多可能的优化章节
+- ...以及更多可能的优化方向
 
 ## 快速开始
 
@@ -35,7 +39,9 @@ cargo run --example basic
 cargo test
 ```
 
-## 架构概览
+## 架构概览（学习笔记）
+
+这是我目前理解的数据库架构，可能存在理解不准确的地方：
 
 ```
                      ┌──────────────────────────────────┐
@@ -72,18 +78,18 @@ stupid-kv/
 │   └── error/        # 错误类型定义
 │   └── lib.rs
 ├── examples/       # 示例代码
-├── docs/           # 设计文档
+├── docs/           # 学习笔记
 └── Cargo.toml
 ```
 
-## 设计文档
+## 学习笔记
 
-每一节实现对应一个设计文档：
+每一节学习内容都有对应的笔记文档，记录了我的学习过程和理解：
 
-| 章节 | 文档 | 标签 |
-|------|------|------|
+| 章节 | 笔记文档 | 标签 |
+|------|----------|------|
 | 基本 MVCC 事务 | [001_basic_transaction.md](docs/001_basic_transaction.md) | `0.0.1` |
 
 ## License
 
-本项目为学习项目，仅供学习研究使用。
+本项目为个人学习项目，仅供学习研究使用。
