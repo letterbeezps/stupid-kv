@@ -12,13 +12,21 @@
 
 我会把学习过程中的每一个阶段做成一个教程，每一节对应一个 git tag，可以通过 `git checkout <tag>` 查看对应版本的代码。
 
-### 已完成的学习内容
+### 完成进度
 
-| Tag | 章节 | 学习内容 |
+| Tag | 章节 | 内容 |
 |-----|------|----------|
 | [`0.0.1`](https://github.com/letterbeezps/stupid-kv/tree/0.0.1) | Section 0.0.1 — 基本 MVCC 事务 | 纯内存 KV，MVCC 多版本并发控制，快照隔离，写-写冲突检测 |
+| [`0.0.2`](https://github.com/letterbeezps/stupid-kv/tree/0.0.2) | Section 0.0.2 — SSI 与 Bloom 过滤器 | Serializable Snapshot Isolation，readset 追踪，读-写冲突检测，Bloom 过滤器加速冲突检测 |
 
-详细笔记：[docs/001_basic_transaction.md](docs/001_basic_transaction.md)
+## 学习笔记
+
+每一节学习内容都有对应的笔记文档，记录了我的学习过程和理解：
+
+| 章节 | 笔记文档 | 标签 |
+|------|----------|------|
+| 基本 MVCC 事务 | [001_basic_transaction.md](docs/001_basic_transaction.md) | `0.0.1` |
+| SSI 与 Bloom 过滤器 | [002_ssi_bloom_filter.md](docs/002_ssi_bloom_filter.md) | `0.0.2` |
 
 ### 计划学习的内容
 
@@ -26,7 +34,6 @@
 
 - **GC** — 历史版本清理，提交队列清理
 - **持久化** — WAL / Snapshot 持久化到磁盘
-- **SSI** — Serializable Snapshot Isolation
 - ...以及更多可能的优化方向
 
 ## 快速开始
@@ -59,6 +66,7 @@ cargo test
                      │      Transaction         │
                      │  commit: snapshot id     │
                      │  version: timestamp      │
+                     │  readset: read keys      │
                      │  writeset: local mods    │
                      │  get/set/del             │
                      └──────────────────────────┘
@@ -71,8 +79,9 @@ stupid-kv/
 ├── src/
 │   ├── db/           # 数据库入口与核心状态
 │   ├── oracle/       # Oracle 全局时间戳分配器
+│   ├── bloom/        # Bloom 过滤器
 │   ├── tx/           # 事务实现
-│   ├── versions/       # 多版本数据管理
+│   ├── versions/     # 多版本数据管理
 │   ├── queue/          # 提交队列与合并队列
 │   ├── kv/             # key/value 类型转换
 │   └── error/        # 错误类型定义
@@ -81,14 +90,6 @@ stupid-kv/
 ├── docs/           # 学习笔记
 └── Cargo.toml
 ```
-
-## 学习笔记
-
-每一节学习内容都有对应的笔记文档，记录了我的学习过程和理解：
-
-| 章节 | 笔记文档 | 标签 |
-|------|----------|------|
-| 基本 MVCC 事务 | [001_basic_transaction.md](docs/001_basic_transaction.md) | `0.0.1` |
 
 ## License
 
