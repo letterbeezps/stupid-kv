@@ -9,6 +9,9 @@ pub enum Error {
     #[error("Write conflict, retry the transaction")]
     KeyWriteConflict,
 
+    #[error("Read conflict, retry the transaction")]
+    KeyReadConflict,
+
     #[error("Transaction is not writable")]
     TxNotWritable,
 

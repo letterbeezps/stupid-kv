@@ -1,9 +1,16 @@
 use std::{ collections::BTreeMap, sync::{Arc, atomic::Ordering}};
 
 use bytes::Bytes;
-use parking_lot::lock_api::RwLock;
+use papaya::HashSet;
+use parking_lot::{Mutex, lock_api::RwLock};
 
-use crate::{db::inner::Inner, error::Error, kv::IntoBytes, queue::{Commit, Merge}, tx::IsolationLevel, versions::{Version, Versions}};
+use crate::{bloom::BloomFilter};
+use crate::db::inner::Inner;
+use crate::error::Error;
+use crate::kv::IntoBytes;
+use crate::queue::{Commit, Merge};
+use crate::tx::IsolationLevel;
+use crate::versions::{Version, Versions};
 
 
 pub(crate) struct TransactionInner {
@@ -17,6 +24,10 @@ pub(crate) struct TransactionInner {
     pub(crate) commit: u64,
     /// 该事务创建时db的数据的当前版本号，由db::Inner::Oracle分配
     pub(crate) version: u64,
+    /// 该事务读取的键值对的键集合
+    pub(crate) readset: HashSet<Bytes>,
+    /// 该事务读取的键值对的键集合的布隆过滤器
+    pub (crate) readeset_bloom: Mutex<BloomFilter>,
     /// 该事务的写操作键值对，键为键，值为值
     pub(crate) writeset: BTreeMap<Bytes, Option<Bytes>>,
     /// 该事务的数据库实例
@@ -33,6 +44,8 @@ impl TransactionInner {
             write,
             commit,
             version,
+            readset: HashSet::new(),
+            readeset_bloom: Mutex::new(BloomFilter::new()),
             writeset: BTreeMap::new(),
             database: db,
         }
@@ -54,6 +67,10 @@ impl TransactionInner {
             return Err(Error::TxClosed);
         }
         self.done = true;
+        if self.mode >= IsolationLevel::SerializableSnapshotIsolation {
+            self.readset.pin().clear();
+            self.readeset_bloom.lock().clear();
+        }
         self.writeset.clear();
         Ok(())
     }
@@ -67,10 +84,22 @@ impl TransactionInner {
             return Ok(());
         }
         let writeset = Arc::new(std::mem::take(&mut self.writeset));
+        let mut  writeset_bloom = BloomFilter::new();
+        for key in writeset.keys() {
+            writeset_bloom.insert(key);
+        }
+
+        // 提取writeset中的最大key和最小key
+        let max_key = writeset.keys().next_back().cloned().unwrap_or_default();
+        let min_key = writeset.keys().next().cloned().unwrap_or_default();
+
         // 尝试将数据写入提交队列, 并返回事务提交ID和提交的结果
         let (version, entry) = self.auto_commit(Commit { 
             writeset: writeset.clone(),
             id: self.database.transaction_queue_id.fetch_add(1, Ordering::AcqRel) + 1, 
+            writeset_bloom,
+            max_key,
+            min_key,
         });
         // 事务要求时快照隔离级别，也就是可重复读取
         if self.mode >= IsolationLevel::SnapshotIsolation {
@@ -78,11 +107,28 @@ impl TransactionInner {
             // 扫描从该事务创建时的提交ID + 1开始，到当前事务的提交ID结束，扫描所有其他事务修改的键值对，左闭右开，
             // 如果有其他事务修改了相同的键值对，就返回错误
             for tx in self.database.transaction_commit_queue.range(self.commit + 1 .. version) {
-                if !tx.value().is_disjoint_writeset(&entry) {
+                if !tx.value().is_disjoint_writeset_bloom(&entry) {
                     self.database.transaction_commit_queue.remove(&version);
+                    if self.mode >= IsolationLevel::SerializableSnapshotIsolation {
+                        self.readset.pin().clear();
+                        self.readeset_bloom.lock().clear();
+                    }
                     self.writeset.clear();
                     return Err(Error::KeyWriteConflict);
                 }
+                if self.mode >= IsolationLevel::SerializableSnapshotIsolation {
+                if !tx
+                    .value()
+                    .is_disjoint_readset_bloom(&self.readset, &self.readeset_bloom.lock())
+                {
+                    self.database.transaction_commit_queue.remove(&version);
+                    
+                    self.readset.pin().clear();
+                    self.readeset_bloom.lock().clear();
+                    self.writeset.clear();
+                    return Err(Error::KeyReadConflict);
+                }
+            }
             }
         }
         // 将数据写入合并队列，返回合并数据的版本号和数据本身
@@ -113,6 +159,10 @@ impl TransactionInner {
         }
         // 从合并队列中移除数据，此时数据已经写入数据存储，可以安全地移除，合并队列只存储待提交的数据
         self.database.transaction_merge_queue.remove(&version);
+        if self.mode >= IsolationLevel::SerializableSnapshotIsolation {
+            self.readset.pin().clear();
+            self.readeset_bloom.lock().clear();
+        }
         // 清空事务的写操作键值对
         self.writeset.clear();
         Ok(())
@@ -133,7 +183,17 @@ impl TransactionInner {
             // 如果事务是写事务，就从写操作键值对中检查键是否存在
             true => match self.writeset.get(lookup) {
                 Some(_) => true,
-                None => self.exists_in_datastore(lookup, self.version),
+                None => {
+                    let res = self.exists_in_datastore(lookup, self.version);
+                    if self.mode >= IsolationLevel::SerializableSnapshotIsolation {
+                        let guard = self.readset.pin();
+                        if !guard.contains(lookup) {
+                            guard.insert(lookup.into_bytes());
+                            self.readeset_bloom.lock().insert(lookup);
+                        }
+                    }
+                    res
+                }
             },
             // 如果事务是读事务，就从数据存储中检查键是否存在
             false => self.exists_in_datastore(lookup, self.version),
@@ -157,6 +217,13 @@ impl TransactionInner {
                 Some(v) => v.clone(),
                 None => {
                     let res = self.fetch_in_datastore(lookup, self.version);
+                    if self.mode >= IsolationLevel::SerializableSnapshotIsolation {
+                        let guard = self.readset.pin();
+                        if !guard.contains(lookup) {
+                            guard.insert(lookup.into_bytes());
+                            self.readeset_bloom.lock().insert(lookup);
+                        }
+                    }
                     res
                 },
             },

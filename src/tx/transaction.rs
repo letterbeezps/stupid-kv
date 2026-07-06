@@ -15,6 +15,11 @@ impl Transaction {
         self.inner.as_mut().unwrap().mode = IsolationLevel::SnapshotIsolation;
         self
     }
+		
+    pub fn with_serializable_snapshot_isolation(mut self) -> Self {
+        self.inner.as_mut().unwrap().mode = IsolationLevel::SerializableSnapshotIsolation;
+        self
+    }
     
     pub fn version(&self) -> u64 {
         self.inner.as_ref().unwrap().version()
@@ -254,7 +259,7 @@ mod tests {
 			assert!(txn2.commit().is_ok());
 		}
 
-		// conflict when the read key was updated by another transaction
+		// conflict when the write key was updated by another transaction
 		{
 			let mut txn1 = db.transaction(true);
 			let mut txn2 = db.transaction(true);
@@ -294,24 +299,89 @@ mod tests {
 			assert!(txn2.commit().is_err());
 		}
 
-		// write-skew: read conflict when the read key was deleted by another
-		// transaction
-		{
-			let key = "key4";
+	}
 
-			let mut txn1 = db.transaction(true);
+	#[test]
+	fn test_serializable_snapshot_isolation() {
+		let db = Database::new();
+
+		let key1 = "key1";
+		let key2 = "key2";
+		let value1 = "baz";
+		let value2 = "bar";
+
+		// no conflict
+		{
+			let mut txn1 = db.transaction(true).with_serializable_snapshot_isolation();
+			let mut txn2 = db.transaction(true).with_serializable_snapshot_isolation();
+
+			txn1.set(key1, value1).unwrap();
+			assert!(txn1.commit().is_ok());
+
+			assert!(txn2.get(key2).unwrap().is_none());
+			txn2.set(key2, value2).unwrap();
+			assert!(txn2.commit().is_ok());
+		}
+
+		// conflict when the write key was updated by another transaction
+		{
+			let mut txn1 = db.transaction(true).with_serializable_snapshot_isolation();
+			let mut txn2 = db.transaction(true).with_serializable_snapshot_isolation();
+
+			txn1.set(key1, value1).unwrap();
+			assert!(txn1.commit().is_ok());
+
+			assert!(txn2.get(key1).is_ok());
+			txn2.set(key1, value2).unwrap();
+			assert!(txn2.commit().is_err());
+		}
+
+		// blind writes should not succeed
+		{
+			let mut txn1 = db.transaction(true).with_serializable_snapshot_isolation();
+			let mut txn2 = db.transaction(true).with_serializable_snapshot_isolation();
+
+			txn1.set(key1, value1).unwrap();
+			txn2.set(key1, value2).unwrap();
+
+			txn1.commit().unwrap();
+			assert!(txn2.commit().is_err());
+		}
+
+		// conflict when the read key was updated by another transaction
+		{
+			let key = "key3";
+
+			let mut txn1 = db.transaction(true).with_serializable_snapshot_isolation();
+			let mut txn2 = db.transaction(true).with_serializable_snapshot_isolation();
+
 			txn1.set(key, value1).unwrap();
 			txn1.commit().unwrap();
 
-			let mut txn2 = db.transaction(true);
-			let mut txn3 = db.transaction(true);
+			assert!(txn2.get(key).unwrap().is_none());
+			txn2.set(key, value1).unwrap();
+			assert!(txn2.commit().is_err());
+		}
+
+		// SSI 通过 读冲突检测 （Read Conflict Detection）来防止 Write-Skew：
+		// 当事务提交时，检查它读取过的所有 key 是否在事务生命周期内被其他事务修改过，如果有则拒绝提交。
+		{
+			let key = "key4";
+
+			let mut txn1 = db.transaction(true).with_serializable_snapshot_isolation();
+			txn1.set(key, value1).unwrap();
+			txn1.commit().unwrap();
+
+			let mut txn2 = db.transaction(true).with_serializable_snapshot_isolation();
+			let mut txn3 = db.transaction(true).with_serializable_snapshot_isolation();
 
 			txn2.del(key).unwrap();
 			assert!(txn2.commit().is_ok());
 
 			assert!(txn3.get(key).is_ok());
-			txn3.set(key, value2).unwrap();
-            // SI隔离级别：tx3 和 tx2 有相同的commit id 起点，所以tx3在写入数据的时候会检测到tx2已经删除了key，所以会报错
+			txn3.set(key1, value2).unwrap();
+            // SSI隔离级别：tx3 和 tx2 有相同的commit id 起点，
+			// 尽管tx3没有修改key，只是读取了key，但是tx3在提交时发现tx2已经修改了key，所以会报错
 			assert!(txn3.commit().is_err());
 		}
 	}
