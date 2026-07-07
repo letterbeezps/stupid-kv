@@ -1,100 +1,89 @@
-# Project Context — stupid-kv
+# CLAUDE.md
 
-This is a tutorial project: a Rust implementation of an MVCC KV database, based on [`surrealdb/surrealmx`](https://github.com/surrealdb/surrealmx).
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Identity
+## Project Overview
+
+Tutorial project: an incremental Rust implementation of an MVCC key-value database, based on [`surrealdb/surrealmx`](https://github.com/surrealdb/surrealmx). Each completed section gets a git tag.
 
 - **Language:** Rust (2021 edition)
-- **Purpose:** Learning database kernel development by building incrementally
-- **Storage:** In-memory only (for now)
-- **Concurrency:** MVCC with Snapshot Isolation
-- **Reference:** [`surrealdb/surrealmx`](https://github.com/surrealdb/surrealmx)
-
-## Progress Convention
-
-Each completed section corresponds to a **git tag**. Tags are assigned at completion time — planning items below are rough ideas, not a strict order; optimization sections may be inserted mid-way.
-
-| Tag | Section | Status |
-|-----|---------|--------|
-| `0.0.1` | Basic MVCC transactions | ✅ done |
-
-**Rough planning (unordered, subject to insertion of optimization sections):**
-
-- GC — version history cleanup, commit queue cleanup
-- Persistence — WAL / Snapshot on-disk
-- SSI — Serializable Snapshot Isolation
-- ...and possibly more optimization sections
-
-Checkout a specific version: `git checkout <tag>`
-
-## Project Layout
-
-```
-stupid-kv/
-├── src/
-│   ├── db/           # Database + Inner (shared state)
-│   ├── oracle/       # Global timestamp oracle
-│   ├── tx/           # Transaction implementation
-│   ├── versions/     # Multi-version data management
-│   ├── queue/        # Commit queue + merge queue
-│   ├── kv/           # Key/value type conversions (IntoBytes)
-│   ├── error/        # Error types (Error enum)
-│   └── lib.rs        # Public API
-├── examples/         # Runnable examples (cargo run --example <name>)
-├── docs/             # Design documents (001_*.md, 002_*.md, ...)
-├── README.md         # Project overview & progress
-├── .trae/rules/      # Trae IDE assistant rules
-└── Cargo.toml
-```
-
-## Key Dependencies
-
-| Crate | Usage |
-|-------|-------|
-| `crossbeam-skiplist` | Lock-free concurrent SkipMap (commit queue, datastore) |
-| `parking_lot` | RwLock for per-key version access |
-| `smallvec` | Stack-allocated version lists (SmallVec<[Version; 4]>) |
-| `bytes` | Byte buffer type |
-| `thiserror` | Error types |
-| `arc-swap` | Arc reference handling |
-
-## Document Style Rules
-
-1. **Diagrams (ASCII architecture, flow charts, etc.) — All labels and descriptions inside code block diagrams **must use English**. Body text around them uses Chinese.
-2. **Design docs live in `docs/`** — named `001_basic_transaction.md`, `002_gc.md`, etc.
-3. **Each section's design doc should explain:
-   - What's being built & why
-   - Core data structures with code snippets
-   - Key algorithms (read path, write path, conflict detection, etc.)
-   - Design tradeoffs (pros / cons table)
-   - Architecture diagram (ASCII, English labels)
-   - Worked example with concrete values
-
-## Workflow — Adding a New Section
-
-When implementing a new section (e.g., Section 0.0.2 GC):
-
-1. **Design first — write `docs/002_gc.md` explaining the design
-2. **Implement** — write code in relevant modules
-3. **Add examples** — add an `examples/` entry if it demonstrates usage
-4. **Update README** — add a row to the completed table
-5. **Tag** — `git tag -a 0.0.2 -m "Section 0.0.2: GC for version history and commit queue"`
-
-## Core Concepts (for context)
-
-- **Oracle** — monotonic global timestamp generator (u64, based on system time in nanoseconds)
-- **`commit`** — sequence ID from `transaction_commit_id`, used for write conflict detection
-- **`version`** — timestamp from Oracle, used for snapshot read visibility
-- **writeset** — `BTreeMap<Bytes, Option<Bytes>>`, `None` means tombstone (delete)
-- **Commit queue** — `SkipMap<u64, Arc<Commit>>`, keeps committed writesets for conflict detection
-- **Merge queue** — `SkipMap<u64, Arc<Merge>>`, temporary queue during datastore write
-- **First-Committer-Wins** — write conflict detection strategy
-- **Snapshot Isolation** — current isolation level; reads see a consistent snapshot at transaction creation time
+- **Storage:** In-memory only
+- **Concurrency:** MVCC with Snapshot Isolation (SI) and Serializable Snapshot Isolation (SSI)
 
 ## Commands
 
 ```bash
-cargo test              # run unit tests
-cargo run --example basic  # run example
-cargo build             # build library
+cargo test                          # run all tests
+cargo test <test_name>              # run a single test by name
+cargo test -- --nocapture           # run tests with stdout
+cargo run --example basic           # run an example
+cargo build                         # build library
 ```
+
+## Architecture
+
+### Core Data Flow
+
+A transaction goes through three stages before data lands in the datastore:
+
+```
+Transaction (writeset) → commit queue (conflict check) → merge queue (pending write) → datastore
+```
+
+1. `auto_commit` inserts a `Commit` entry into `transaction_commit_queue` with an atomically assigned commit ID.
+2. Conflict detection scans `transaction_commit_queue` entries from `(tx.commit + 1)..current_commit_id`.
+3. `atomic_merge` inserts a `Merge` entry into `transaction_merge_queue` with an Oracle-assigned nanosecond timestamp as the MVCC version.
+4. The writeset is applied key-by-key into `datastore`, each key holding a `RwLock<Versions>`.
+5. The merge queue entry is removed; the commit queue entry persists for future conflict detection.
+
+### Key Structures
+
+- **`Inner`** (`src/db/inner.rs`) — shared state behind `Arc`, holds all queues and the datastore.
+- **`TransactionInner`** (`src/tx/transaction_inner.rs`) — per-transaction state: `commit` (snapshot of commit ID at tx start), `version` (Oracle timestamp at tx start), `writeset`, `readset` (SSI only), `readset_bloom`.
+- **`Versions`** (`src/versions/versions.rs`) — sorted `SmallVec<[Version; 4]>` of `(version: u64, value: Option<Bytes>)`. `None` is a tombstone. `fetch_version(v)` returns the newest value with version ≤ v.
+- **`Commit`** (`src/queue/commit.rs`) — writeset snapshot stored in commit queue; carries a `BloomFilter` over write keys and `(min_key, max_key)` for fast range skipping during conflict detection.
+- **`BloomFilter`** (`src/bloom/bloom.rs`) — fixed 512-byte (4096-bit) filter using FNV-1a + Kirsch-Mitzenmacher double hashing (k=3). Used to accelerate conflict detection on both writesets and readsets.
+
+### Two IDs: `commit` vs `version`
+
+- **`commit`** — monotonic counter (`transaction_commit_id`), incremented once per committed writeset. Used solely for write/read conflict detection range queries.
+- **`version`** — nanosecond timestamp from Oracle, used as the MVCC snapshot point. Read path uses `version` to find the newest visible value ≤ tx's snapshot version.
+
+### Isolation Levels (`src/tx/isolation.rs`)
+
+- **`SnapshotIsolation`** — detects write-write conflicts by checking if any concurrent committed tx touched the same keys.
+- **`SerializableSnapshotIsolation`** — additionally tracks the readset and detects write-read conflicts (prevents write skew / phantoms).
+
+### Read Path
+
+`get`/`exists` check the **merge queue** first (pending committed writes not yet in datastore, scanned in reverse order by version), then fall back to **datastore**. This avoids a race where a committed tx's data is visible in the merge queue but not yet flushed.
+
+### Conflict Detection (commit path)
+
+1. Build a `BloomFilter` over the writeset keys.
+2. Range-scan `transaction_commit_queue` for commits after `self.commit`.
+3. For each: first do a bloom-range-skip (`max_key`/`min_key`), then bloom `may_contain`, then exact sorted-merge scan (`is_disjoint_writeset`).
+4. For SSI: also check `is_disjoint_readset_bloom` against the current tx's readset.
+
+## Progress Convention
+
+| Tag | Section | Status |
+|-----|---------|--------|
+| `0.0.1` | Basic MVCC transactions | ✅ done |
+| `0.0.2` | SSI + Bloom filter accelerated conflict detection | ✅ done |
+
+Rough planning: GC (version history + commit queue cleanup), Persistence (WAL/Snapshot).
+
+## Adding a New Section
+
+1. Write `docs/00N_name.md` (design: structures, algorithms, tradeoffs, ASCII diagram with English labels, worked example)
+2. Implement in relevant modules
+3. Add `examples/` entry if it demonstrates usage
+4. Update README and the table above
+5. `git tag -a 0.0.N -m "Section 0.0.N: <name>"`
+
+## Document Style
+
+- Diagram labels inside code blocks: **English only**
+- Surrounding prose: Chinese
+- Design docs: `docs/001_basic_transaction.md`, `docs/002_ssi.md`, etc.

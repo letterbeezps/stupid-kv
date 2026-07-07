@@ -40,7 +40,8 @@
 
 ```bash
 # 运行示例
-cargo run --example basic
+cargo run --example 001_basic
+cargo run --example 002_ssi
 
 # 运行单元测试
 cargo test
