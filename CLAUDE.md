@@ -16,7 +16,8 @@ Tutorial project: an incremental Rust implementation of an MVCC key-value databa
 cargo test                          # run all tests
 cargo test <test_name>              # run a single test by name
 cargo test -- --nocapture           # run tests with stdout
-cargo run --example basic           # run an example
+cargo run --example 001_basic       # basic MVCC example
+cargo run --example 002_ssi         # SSI + write-skew example
 cargo build                         # build library
 ```
 
@@ -71,6 +72,7 @@ Transaction (writeset) → commit queue (conflict check) → merge queue (pendin
 |-----|---------|--------|
 | `0.0.1` | Basic MVCC transactions | ✅ done |
 | `0.0.2` | SSI + Bloom filter accelerated conflict detection | ✅ done |
+| `0.0.3` | Runtime hardening (write-path safety, adaptive backoff, Oracle anti-drift) | ✅ done |
 
 Rough planning: GC (version history + commit queue cleanup), Persistence (WAL/Snapshot).
 
@@ -86,4 +88,4 @@ Rough planning: GC (version history + commit queue cleanup), Persistence (WAL/Sn
 
 - Diagram labels inside code blocks: **English only**
 - Surrounding prose: Chinese
-- Design docs: `docs/001_basic_transaction.md`, `docs/002_ssi.md`, etc.
+- Design docs: `docs/001_basic_transaction.md`, `docs/002_ssi_bloom_filter.md`, `docs/003_runtime_hardening.md`, etc.
