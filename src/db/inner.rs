@@ -4,7 +4,7 @@ use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use parking_lot::RwLock;
 
-use crate::{oracle::Oracle, queue::{Commit, Merge}, versions::Versions};
+use crate::{options::DatabaseOptions, oracle::Oracle, queue::{Commit, Merge}, versions::Versions};
 
 
 
@@ -69,9 +69,9 @@ pub struct Inner {
 }
 
 impl Inner {
-    pub fn new() -> Self {
+    pub fn new(opts: &DatabaseOptions) -> Self {
         Self {
-            oracle:Oracle::new(),
+            oracle:Oracle::new(opts.resync_interval),
             transaction_queue_id: AtomicU64::new(0),
             transaction_commit_id: AtomicU64::new(0),
             transaction_commit_queue: SkipMap::new(),
@@ -84,6 +84,6 @@ impl Inner {
 
 impl Default for Inner {
     fn default() -> Self {
-        Self::new()
+        Self::new(&&DatabaseOptions::default())
     }
 }

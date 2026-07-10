@@ -8,6 +8,7 @@ mod oracle;
 mod kv;
 mod error;
 mod bloom;
+mod options;
 
 #[doc(inline)]
 pub use self::db::*;

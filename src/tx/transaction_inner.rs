@@ -138,23 +138,30 @@ impl TransactionInner {
         });
         // 将数据写入数据存储
         for (key, value) in entry.writeset.iter() {
+            // 并发安全设计
+            // 1: 两个commit 并发写入同一个不存在的key
+            // 2: 单个commit 写入一个已经存在的key，但是中途遇到
             let value = value.clone();
-            // 如果键存在，就将新的版本号和值写入版本列表
-            if let Some(entry) = self.database.datastore.get(key) {
-                let mut versions = entry.value().write();
-                versions.push(Version {
-                    version,
-                    value,
-                });
-            } else {
-            // 如果键不存在，就创建一个新的版本列表
-                self.database.datastore.insert(
-                    key.clone(), 
-                    RwLock::new(Versions::from(Version {
-                        version,
-                        value,
-                    })),
-                );
+            loop {
+                let entry = 
+                    self
+                    .database
+                    .datastore
+                    .get_or_insert_with(key.clone(), || {
+                        RwLock::new(Versions::from(Version {
+                            version,
+                            value: value.clone(),
+                        }))
+                    });
+                let mut versions = 
+                    entry
+                    .value()
+                    .write();
+                if entry.is_removed() {
+                    continue;
+                }
+                versions.push(Version { version, value });
+                break;
             }
         }
         // 从合并队列中移除数据，此时数据已经写入数据存储，可以安全地移除，合并队列只存储待提交的数据
@@ -297,6 +304,7 @@ impl TransactionInner {
     /// 这里要考虑并发写入的情况，需要确保数据的原子性，确保每个事务的提交ID是唯一的
     #[inline(always)]
     pub fn auto_commit(&self, updates: Commit) -> (u64, Arc<Commit>) {
+        let mut spins = 0;
         // 数据在事务队列中的队列ID
         let id = updates.id;
         let updates = Arc::new(updates);
@@ -313,6 +321,8 @@ impl TransactionInner {
                 return (version, Arc::clone(&updates));
             }
             // 如果数据写入失败，继续尝试
+            backoff(spins);
+            spins += 1;
         }
     }
 
@@ -320,6 +330,7 @@ impl TransactionInner {
     /// 这里要考虑并发写入的情况，需要确保数据的原子性，确保每个事务的版本号是唯一的
     #[inline(always)]
     fn atomic_merge(&self, updates: Merge) -> (u64, Arc<Merge>) {
+        let mut spins = 0;
         // 数据在合并队列中的队列ID
         let id = updates.id;
         let updates = Arc::new(updates);
@@ -342,6 +353,8 @@ impl TransactionInner {
                 return (version, Arc::clone(&updates));
             }
             // 如果数据写入失败，继续尝试
+            backoff(spins);
+            spins += 1;
         }
     }
 
@@ -414,4 +427,24 @@ impl TransactionInner {
         })
     }
 
+}
+
+/// 自适应退避：随竞争次数升级策略，避免无效 CPU 空转（乐观先快，悲观后让）
+/// - spins < 10:   spin_loop hint — 发出 x86 PAUSE / ARM YIELD 指令，线程仍占用 CPU，但降低
+///                 流水线投机执行压力，减少内存总线流量，让同核超线程（HyperThread）有机会推进
+/// - spins < 100:  yield_now     — 主动让出当前时间片，OS 调度器可将 CPU 分配给持 slot 的线程，
+///                 CPU 利用率不变但有效工作增加，避免纯自旋浪费整个核心
+/// - spins >= 100: park_timeout  — 将线程挂起 10µs，CPU 完全释放给其他线程，消除活锁风险，
+///                 代价是唤醒延迟（需等 OS 调度），适合高并发下竞争持续无法快速解决的情况
+#[inline(always)]
+fn backoff(spins: usize) {
+    if spins < 10 {
+        std::hint::spin_loop();
+    } else {
+        if spins < 100 {
+            std::thread::yield_now();
+        } else {
+            std::thread::park_timeout(std::time::Duration::from_micros(10));
+        }
+    }
 }
