@@ -18,6 +18,7 @@
 |-----|------|----------|
 | [`0.0.1`](https://github.com/letterbeezps/stupid-kv/tree/0.0.1) | Section 0.0.1 — 基本 MVCC 事务 | 纯内存 KV，MVCC 多版本并发控制，快照隔离，写-写冲突检测 |
 | [`0.0.2`](https://github.com/letterbeezps/stupid-kv/tree/0.0.2) | Section 0.0.2 — SSI 与 Bloom 过滤器 | Serializable Snapshot Isolation，readset 追踪，读-写冲突检测，Bloom 过滤器加速冲突检测 |
+| [`0.0.3`](https://github.com/letterbeezps/stupid-kv/tree/0.0.3) | Section 0.0.3 — 运行时鲁棒性加固 | 写路径并发安全（封堵静默丢数据窗口），auto_commit / atomic_merge 自适应退避，Oracle 后台 resync 抗时钟漂移，DatabaseOptions 参数入口 |
 
 ## 学习笔记
 
@@ -27,6 +28,7 @@
 |------|----------|------|
 | 基本 MVCC 事务 | [001_basic_transaction.md](docs/001_basic_transaction.md) | `0.0.1` |
 | SSI 与 Bloom 过滤器 | [002_ssi_bloom_filter.md](docs/002_ssi_bloom_filter.md) | `0.0.2` |
+| 运行时鲁棒性加固 | [003_runtime_hardening.md](docs/003_runtime_hardening.md) | `0.0.3` |
 
 ### 计划学习的内容
 
@@ -79,12 +81,13 @@ cargo test
 stupid-kv/
 ├── src/
 │   ├── db/           # 数据库入口与核心状态
-│   ├── oracle/       # Oracle 全局时间戳分配器
+│   ├── oracle/       # Oracle 全局时间戳分配器（含后台 resync）
 │   ├── bloom/        # Bloom 过滤器
-│   ├── tx/           # 事务实现
+│   ├── tx/           # 事务实现（含自适应退避）
 │   ├── versions/     # 多版本数据管理
 │   ├── queue/          # 提交队列与合并队列
 │   ├── kv/             # key/value 类型转换
+│   ├── options/      # 运行时参数入口 DatabaseOptions
 │   └── error/        # 错误类型定义
 │   └── lib.rs
 ├── examples/       # 示例代码
