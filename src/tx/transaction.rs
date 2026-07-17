@@ -1,7 +1,7 @@
 use bytes::Bytes;
 
 use crate::kv::IntoBytes;
-use crate::tx::TransactionInner;
+use crate::tx::{TransactionInner, release_counter};
 use crate::error::Error;
 use crate::tx::isolation::IsolationLevel;
 
@@ -9,6 +9,25 @@ use crate::tx::isolation::IsolationLevel;
 pub struct Transaction {
     pub(crate) inner: Option<TransactionInner>,
 }
+
+impl Drop for Transaction {
+	/// 事务销毁时释放其在 `counter_by_commit` 上持有的引用计数。
+	///
+	/// - 无论事务是 commit 成功、cancel 还是被显式 drop，都会走到这里；
+	/// - `release_counter` 返回 true 表示该 counter 引用归零并已被打上墓碑，
+	///   此时由本事务负责把对应 entry 从 `counter_by_commit` 中摘除，
+	///   避免 map 内堆积无用的空计数槽；
+	/// - 计数归零意味着不再有活跃事务把该 commit 作为快照起点，
+	///   后台 GC 就可以把 `< 该 commit` 的 commit queue entry 清掉。
+	fn drop(&mut self) {
+		if let Some(inner) = self.inner.take() {
+			if release_counter(&inner.counter_commit) {
+				inner.database.counter_by_commit.remove(&inner.commit);
+			}
+		}
+	}
+}
+
 impl Transaction {
 
     pub fn with_snapshot_isolation(mut self) -> Self {
