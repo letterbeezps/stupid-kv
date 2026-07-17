@@ -19,6 +19,7 @@
 | [`0.0.1`](https://github.com/letterbeezps/stupid-kv/tree/0.0.1) | Section 0.0.1 — 基本 MVCC 事务 | 纯内存 KV，MVCC 多版本并发控制，快照隔离，写-写冲突检测 |
 | [`0.0.2`](https://github.com/letterbeezps/stupid-kv/tree/0.0.2) | Section 0.0.2 — SSI 与 Bloom 过滤器 | Serializable Snapshot Isolation，readset 追踪，读-写冲突检测，Bloom 过滤器加速冲突检测 |
 | [`0.0.3`](https://github.com/letterbeezps/stupid-kv/tree/0.0.3) | Section 0.0.3 — 运行时鲁棒性加固 | 写路径并发安全（封堵静默丢数据窗口），auto_commit / atomic_merge 自适应退避，Oracle 后台 resync 抗时钟漂移，DatabaseOptions 参数入口 |
+| [`0.0.4`](https://github.com/letterbeezps/stupid-kv/tree/0.0.4) | Section 0.0.4 — 提交队列 GC | 活跃事务引用计数 `counter_by_commit`，Dekker 风格双 fence 协议（`register_counter` ↔ `earliest_active`），后台清理线程 + 优雅停机，避免 `transaction_commit_queue` 无限增长 |
 
 ## 学习笔记
 
@@ -29,12 +30,13 @@
 | 基本 MVCC 事务 | [001_basic_transaction.md](docs/001_basic_transaction.md) | `0.0.1` |
 | SSI 与 Bloom 过滤器 | [002_ssi_bloom_filter.md](docs/002_ssi_bloom_filter.md) | `0.0.2` |
 | 运行时鲁棒性加固 | [003_runtime_hardening.md](docs/003_runtime_hardening.md) | `0.0.3` |
+| 提交队列 GC | [004_commit_queue_gc.md](docs/004_commit_queue_gc.md) | `0.0.4` |
 
 ### 计划学习的内容
 
 这些是我接下来想学习的内容，进度可能会比较慢，也可能随时调整：
 
-- **GC** — 历史版本清理，提交队列清理
+- **版本历史 GC** — 复用 0.0.4 的水位线机制，裁剪 datastore 中过期的 MVCC 版本
 - **持久化** — WAL / Snapshot 持久化到磁盘
 - ...以及更多可能的优化方向
 
@@ -62,6 +64,8 @@ cargo test
                      │  commit queue                    │
                      │  merge queue                     │
                      │  datastore                       │
+                     │  counter_by_commit ── active tx  │
+                     │  cleanup worker    ── GC thread  │
                      └───────────┬──────────────────────┘
                                  │ shared ref
                                  ▼
@@ -80,10 +84,10 @@ cargo test
 ```
 stupid-kv/
 ├── src/
-│   ├── db/           # 数据库入口与核心状态
+│   ├── db/           # 数据库入口与核心状态（含后台 cleanup worker）
 │   ├── oracle/       # Oracle 全局时间戳分配器（含后台 resync）
 │   ├── bloom/        # Bloom 过滤器
-│   ├── tx/           # 事务实现（含自适应退避）
+│   ├── tx/           # 事务实现（含自适应退避、活跃事务引用计数）
 │   ├── versions/     # 多版本数据管理
 │   ├── queue/          # 提交队列与合并队列
 │   ├── kv/             # key/value 类型转换
