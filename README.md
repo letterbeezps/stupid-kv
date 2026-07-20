@@ -32,6 +32,14 @@
 | 运行时鲁棒性加固 | [003_runtime_hardening.md](docs/003_runtime_hardening.md) | `0.0.3` |
 | 提交队列 GC | [004_commit_queue_gc.md](docs/004_commit_queue_gc.md) | `0.0.4` |
 
+### 番外篇
+
+正文以外的补充材料，从不同视角把主线内容串起来：
+
+| 番外 | 笔记文档 | 关联章节 |
+|------|----------|----------|
+| 从测试用例走读隔离级别 | [extras/001_isolation_tests_walkthrough.md](docs/extras/001_isolation_tests_walkthrough.md) | `0.0.1` / `0.0.2` |
+
 ### 计划学习的内容
 
 这些是我接下来想学习的内容，进度可能会比较慢，也可能随时调整：
