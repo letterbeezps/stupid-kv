@@ -718,4 +718,76 @@ mod test {
 		assert_eq!(versions.inner.len(), 1);
 		assert_eq!(versions.fetch_version(10), Some(Bytes::from("v99".to_string())));
 	}
+
+	// ==================== Tests for gc_older_versions ====================
+	//
+	// gc_older_versions 的关键不变量：水位线 `floor` 下最新可见的那条版本
+	// （若为 tombstone 则整条链可丢）必须留下，任何 snapshot ∈ [floor, +∞)
+	// 的读事务都不能因为 GC 而看到不一致的旧值。以下 5 个用例覆盖：
+	//   - floor 落在"值 → 删除"的空档（回归用例）；
+	//   - floor 落在"值 → 值"的空档；
+	//   - floor 恰好命中某条可见值；
+	//   - floor 之下最新可见是 tombstone，整链回收；
+	//   - floor 比最早版本还小，无可回收。
+
+	// 场景 1：floor 落在 (value, delete) 空档，value 必须保留
+	#[test]
+	fn test_gc_keeps_version_visible_at_floor() {
+		// Regression: the GC floor falls in the gap between a value and a
+		// later delete. A reader whose snapshot lands in [floor, delete) must
+		// still observe the value, so it must survive GC.
+		let mut v = make_versions(vec![(10, Some("v1")), (40, None)]);
+		v.gc_older_versions(30);
+		// The value visible at 30 (and at 35) must remain readable.
+		assert_eq!(v.fetch_version(30), Some(Bytes::from("v1".to_string())));
+		assert_eq!(v.fetch_version(35), Some(Bytes::from("v1".to_string())));
+		// At/after the delete it is gone.
+		assert_eq!(v.fetch_version(40), None);
+	}
+
+	// 场景 2：floor 落在 (value, value) 空档，较旧的 value 仍是 floor 处可见值
+	#[test]
+	fn test_gc_keeps_value_before_newer_version_in_gap() {
+		// Floor in the gap between two values: the earlier value is visible at
+		// the floor and must survive.
+		let mut v = make_versions(vec![(10, Some("v1")), (50, Some("v2"))]);
+		v.gc_older_versions(30);
+		assert_eq!(v.fetch_version(30), Some(Bytes::from("v1".to_string())));
+		assert_eq!(v.fetch_version(49), Some(Bytes::from("v1".to_string())));
+		assert_eq!(v.fetch_version(50), Some(Bytes::from("v2".to_string())));
+	}
+
+	// 场景 3：floor 恰好命中某条 value，更旧的历史被丢弃、命中的这条保留
+	#[test]
+	fn test_gc_drops_versions_below_visible() {
+		// Floor exactly on a value: older versions are reclaimed, the visible
+		// one is kept.
+		let mut v = make_versions(vec![(10, Some("v1")), (30, Some("v2"))]);
+		assert_eq!(v.fetch_version(10), Some(Bytes::from("v1".to_string())));
+		assert_eq!(v.gc_older_versions(30), 1);
+		assert_eq!(v.fetch_version(10), None);
+		assert_eq!(v.fetch_version(30), Some(Bytes::from("v2".to_string())));
+		assert_eq!(v.fetch_version(35), Some(Bytes::from("v2".to_string())));
+	}
+
+	// 场景 4：floor 下最新可见是 tombstone，整条版本链都可回收
+	#[test]
+	fn test_gc_collapses_fully_deleted_key() {
+		// Visible entry at the floor is a delete tombstone: the whole chain is
+		// reclaimable.
+		let mut v = make_versions(vec![(10, Some("v1")), (30, None)]);
+		assert_eq!(v.gc_older_versions(40), 0);
+		assert_eq!(v.fetch_version(10), None);
+		assert_eq!(v.fetch_version(40), None);
+	}
+
+	// 场景 5：floor 比最早版本还小（lte == 0），版本链原封不动
+	#[test]
+	fn test_gc_retains_all_when_floor_below_everything() {
+		// Floor below the earliest version: nothing is reclaimable.
+		let mut v = make_versions(vec![(10, Some("v1")), (20, Some("v2"))]);
+		assert_eq!(v.gc_older_versions(5), 2);
+		assert_eq!(v.fetch_version(10), Some(Bytes::from("v1".to_string())));
+		assert_eq!(v.fetch_version(20), Some(Bytes::from("v2".to_string())));
+	}
 }
