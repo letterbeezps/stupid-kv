@@ -3,7 +3,7 @@ use std::time::Duration;
 use std::{ops::Deref, sync::Arc};
 
 use crate::db::inner::Inner;
-use crate::options::{DEFAULT_CLEANUP_INTERVAL, DatabaseOptions};
+use crate::options::{DEFAULT_CLEANUP_INTERVAL, DEFAULT_GC_FULL_SCAN_FREQUENCY, DEFAULT_GC_INTERVAL, DatabaseOptions};
 use crate::tx::{Transaction, TransactionInner};
 
 
@@ -11,8 +11,14 @@ use crate::tx::{Transaction, TransactionInner};
 pub struct Database {
     inner: Arc<Inner>,
 
-	/// 后台 GC 清理线程的扫描周期，取自 `DatabaseOptions::cleanup_interval`。
+	/// commit queue GC 后台线程扫描周期。
 	cleanup_interval: Duration,
+
+	/// 版本 GC 后台线程扫描周期。
+	gc_interval: Duration,
+
+	/// 每 N 轮增量 GC 触发一次全量 GC；启动时会 clamp 到 `.max(1)` 防 `% 0` 除零。
+	gc_full_scan_frequency: u64
 }
 
 impl Default for Database {
@@ -21,6 +27,10 @@ impl Default for Database {
             inner: Arc::new(Inner::default()),
 
 			cleanup_interval: DEFAULT_CLEANUP_INTERVAL,
+
+			gc_interval: DEFAULT_GC_INTERVAL,
+
+			gc_full_scan_frequency: DEFAULT_GC_FULL_SCAN_FREQUENCY,
         }
     }
 }
@@ -46,17 +56,22 @@ impl Database {
         Self::new_with_options(DatabaseOptions::default())
     }
 
-	/// 使用自定义选项构造 Database。
-	/// 当 `opts.enable_cleanup` 为 true 时，会启动一个后台线程周期性执行 commit queue GC。
+	/// 使用自定义选项构造 Database。按 `enable_cleanup` / `enable_gc` 启动两条后台 GC 线程。
 	pub fn new_with_options(opts: DatabaseOptions) -> Self {
 		let inner = Arc::new(Inner::new(&opts));
 		let db = Database {
 			inner,
 			cleanup_interval: opts.cleanup_interval,
+			gc_interval: opts.gc_interval,
+			gc_full_scan_frequency: opts.gc_full_scan_frequency,
 		};
 
 		if opts.enable_cleanup {
 			db.intialise_cleanup_worker();
+		}
+
+		if opts.enable_gc {
+			db.initialise_garbage_worker();
 		}
 
 		db
@@ -67,35 +82,27 @@ impl Database {
         Transaction { inner: Some(inner) }
     }
 
-	/// 手动触发一次 commit queue GC。
-	/// 与后台线程调用的是同一入口，便于测试及在关闭后台线程时按需回收。
+	/// 手动触发一次 commit queue GC，与后台线程共用同一入口。
 	pub fn run_cleanup(&self) {
 		self.inner.run_cleanup_inner();
 	}
 
-	/// 关停后台清理线程：
-	/// 1. 将 `background_threads_enabled` 置为 false，通知线程退出循环；
-	/// 2. `unpark` 唤醒可能正在 `park_timeout` 中沉睡的线程，避免等到超时才退出；
-	/// 3. `join` 等待线程真正结束，保证 Inner 内部结构在无并发访问后再被释放。
+	/// 关停两条后台 GC 线程：置开关 → `unpark` → `join`。
+	/// 未启动的线程（handle 为 None）会被安全跳过。
 	fn shutdown(&self) {
 		self.background_threads_enabled.store(false, Ordering::Relaxed);
-		{
-			if let Some(handle) = self.transaction_cleanup_handle.write().take() {
-				handle.thread().unpark();
-				let _ = handle.join();
-			}
+		if let Some(handle) = self.transaction_cleanup_handle.write().take() {
+			handle.thread().unpark();
+			let _ = handle.join();
+		}
+		if let Some(handle) = self.garbage_collection_handle.write().take() {
+			handle.thread().unpark();
+			let _ = handle.join();
 		}
 	}
 
-	/// 启动后台 GC 清理线程。
-	///
-	/// 线程主循环：
-	/// - `park_timeout(interval)` 挂起等待，既能被 `unpark` 提前唤醒（用于快速关停），
-	///   又能在超时后自然醒来执行一次 `run_cleanup_inner`；
-	/// - 醒来后再次检查 `background_threads_enabled`，避免关停后仍多跑一次清理。
-	///
-	/// 线程通过 clone 的 `Arc<Inner>` 独立持有 Inner 的所有权，
-	/// 与 Database 的生命周期通过 `shutdown` 显式同步。
+	/// 启动 commit queue GC 后台线程。
+	/// `park_timeout` 而非 `sleep`：shutdown 可通过 `unpark` 立即唤醒。
 	fn intialise_cleanup_worker(&self) {
 		let inner = self.inner.clone();
 		if inner.transaction_cleanup_handle.read().is_none() {
@@ -114,7 +121,35 @@ impl Database {
 			});
 			*self.inner.transaction_cleanup_handle.write() = Some(handle);
 		}
+	}
 
+	/// 启动 datastore 版本 GC 后台线程。
+	/// 每轮：`compute_cleanup_ts` 算水位 → 增量 GC，每 N 轮再叠加一次全量 GC。
+	/// 增量与全量共享同轮水位，避免读路径看到不一致的中间态。
+	fn initialise_garbage_worker(&self) {
+		let inner = self.inner.clone();
+		if inner.garbage_collection_handle.read().is_none() {
+			let interval = self.gc_interval;
+			let full_scan_frequency = self.gc_full_scan_frequency.max(1);
+			let handle = std::thread::spawn(move || {
+				let mut cycle: u64 = 0;
+				while inner.background_threads_enabled.load(Ordering::Relaxed) {
+					std::thread::park_timeout(interval);
+
+					if !inner.background_threads_enabled.load(Ordering::Relaxed) {
+						break;
+					}
+
+					let cleanup_ts = inner.compute_cleanup_ts();
+					inner.run_gc_dirty_inner(cleanup_ts);
+					cycle += 1;
+					if cycle.is_multiple_of(full_scan_frequency) {
+						inner.run_gc_full(cleanup_ts);
+					}
+				}
+			});
+			*self.inner.garbage_collection_handle.write() = Some(handle);
+		}
 	}
 }
 

@@ -1,16 +1,17 @@
+use std::collections::HashSet;
 use std::{sync::Arc, thread::JoinHandle};
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 
 use bytes::Bytes;
+use crossbeam_queue::SegQueue;
 use crossbeam_skiplist::SkipMap;
 use parking_lot::RwLock;
 
 use crate::{options::DatabaseOptions, oracle::Oracle, queue::{Commit, Merge}, versions::Versions};
 
-/// `counter_by_commit` 中 counter 的墓碑值：表示该 commit 对应的
-/// 引用计数已经归零，正在等待被从 map 中摘除。之后再想 +1 需要
-/// 换到新的 counter，而不是复活这个已经被判死的 slot。
+/// counter 归零后的墓碑值，`register_counter` 见到墓碑必须放弃该 slot、
+/// 换一个新 counter；防止"归零 → 从 map 摘除"窗口内被复活。
 pub(crate) const COUNTER_TOMBSTONE: u64 = u64::MAX;
 
 /// Stupid-KV 核心存储引擎内部结构体
@@ -68,18 +69,31 @@ pub struct Inner {
     /// 当数据成功写入底层存储后，会从此队列中删除对应的记录
     pub(crate) transaction_merge_queue: SkipMap<u64, Arc<Merge>>,
 
-    /// 活跃事务引用计数表，用于 commit queue GC 计算水位线。
-    ///
-    /// - key：事务开始时读取的 `transaction_commit_id`，即该事务的快照起点 commit
-    /// - value：当前仍持有该快照起点的活跃事务个数（共享的原子计数器）
-    ///
-    /// 事务开始时在对应 counter 上 +1，事务销毁时 -1，减到 0 则从 map 中摘除。
-    /// GC 时通过遍历该 map 取最早的活跃 commit 作为水位线，`< 水位线` 的
-    /// commit queue entry 可以被安全清理。
+    /// 活跃事务快照 commit 引用计数表。key = 事务快照起点 `transaction_commit_id`，
+    /// value = 当前持有该快照的活跃事务数（共享原子计数器）。
+    /// commit queue GC 遍历取最早活跃 key 作水位线，`< 水位线` 的 commit queue
+    /// entry 可安全清理。详见 `docs/004_commit_queue_gc.md`。
     pub(crate) counter_by_commit: SkipMap<u64, Arc<AtomicU64>>,
-    /// 后台 GC 清理线程句柄。
-    /// Database 析构时通过它 join 后台线程，确保清理线程与 Inner 生命周期同步。
+    /// commit queue GC 后台线程句柄，Database 析构时 join。
     pub(crate) transaction_cleanup_handle: RwLock<Option<JoinHandle<()>>>,
+
+    /// 活跃事务快照 version 引用计数表。与 `counter_by_commit` 结构对称，
+    /// 但 key 是 Oracle 时间戳，服务于 datastore 版本 GC。
+    pub(crate) counter_by_oracle: SkipMap<u64, Arc<AtomicU64>>,
+
+    /// datastore 版本 GC 后台线程句柄，Database 析构时 join。
+    pub(crate) garbage_collection_handle: RwLock<Option<JoinHandle<()>>>,
+
+    /// GC 已发布的水位线上界。`compute_cleanup_ts` 在动手回收前 `fetch_max`
+    /// 到此处，`register_counter` 事后检查 `gc_floor <= v`——阻止"新事务恰好
+    /// 拿到已被 GC 判死的快照"这种 counter 事后登记救不回来的情况。
+    /// 详见 `docs/005_version_history_gc.md`。
+    pub(crate) gc_floor: AtomicU64,
+
+    /// 版本 GC 的增量脏 key 队列。事务提交把写入 key 推入本队列，
+    /// GC 线程消费队列只处理最近有写入的 key，避免每轮扫全表；
+    /// `SegQueue` 无锁 MPMC，消费端用 HashSet 去重。
+    pub(crate) gc_dirty_keys: SegQueue<Bytes>,
 
     /// 底层数据存储，存储最终的键值对数据
     /// 每个键对应一个RwLock保护的Versions结构，用于实现MVCC版本管理
@@ -101,6 +115,10 @@ impl Inner {
             transaction_merge_queue: SkipMap::new(),
             counter_by_commit: SkipMap::new(),
             transaction_cleanup_handle: RwLock::new(None),
+            counter_by_oracle: SkipMap::new(),
+            garbage_collection_handle: RwLock::new(None),
+            gc_floor: AtomicU64::new(0),
+            gc_dirty_keys: SegQueue::new(),
             datastore: SkipMap::new(),
             background_threads_enabled: AtomicBool::new(true),
         }
@@ -109,24 +127,28 @@ impl Inner {
 
 impl Inner {
 
-    /// 计算当前活跃事务中最早的快照起点 commit。
-    /// 若 `counter_by_commit` 中没有活跃 counter，则返回 `fallback` 作为兜底水位线。
+    /// 扫描 `counter_by_oracle` 取最早活跃快照 version（datastore 版本 GC 水位线）。
+    /// 空 map 时返回 `fallback`。底层复用 `earliest_active`。
+    #[inline]
+    pub(crate) fn earlist_active_version(&self, fallback: u64) -> u64 {
+        earliest_active(&self.counter_by_oracle, fallback)
+    }
+
+    /// 扫描 `counter_by_commit` 取最早活跃快照 commit（commit queue GC 水位线）。
+    /// 空 map 时返回 `fallback`。底层复用 `earliest_active`。
     #[inline]
 	pub(crate) fn earliest_active_commit(&self, fallback: u64) -> u64 {
 		earliest_active(&self.counter_by_commit, fallback)
 	}
 
-    /// commit queue GC 核心逻辑：删除所有活跃事务不再需要的旧提交记录。
+    /// commit queue GC：删除 `< earliest_active_commit` 的历史 commit entry。
     ///
-    /// 算法：
-    /// 1. 先读 `transaction_commit_id` 作为 fallback 水位线；
-    /// 2. 再扫描 `counter_by_commit` 取最早活跃 commit 作为 oldest；
-    /// 3. 删除 `transaction_commit_queue` 中所有 key `< oldest` 的 entry。
+    /// 先读 `transaction_commit_id` 作 fallback、再扫 counter map：确保漏扫的
+    /// 并发注册事务其快照 `>= fallback`，冲突窗口 `(snapshot, ..)` 不会被误删。
+    /// 用 `< oldest` 而非 `<= oldest`：oldest 本身是某活跃事务快照起点，
+    /// 该事务仍需扫描 `> oldest` 做冲突检测，oldest 自己不能删。
     ///
-    /// 顺序关键：先读 fallback 再扫描 counter map，能保证任何"注册中被漏扫"
-    /// 的并发事务，其快照 `>= fallback`，其冲突窗口 `(snapshot, ..)` 不会被误删。
-    /// 用 `< oldest` 而非 `<= oldest`：oldest 本身是某个活跃事务的快照起点，
-    /// 该事务仍需扫描 `> oldest` 的 commit queue 做冲突检测，oldest 自己不能删。
+    /// 详见 `docs/004_commit_queue_gc.md`。
     pub(crate) fn run_cleanup_inner(&self) {
         let fallback = self.transaction_commit_id.load(Ordering::SeqCst);
         let oldest = self.earliest_active_commit(fallback);
@@ -134,96 +156,97 @@ impl Inner {
             e.remove();
         });
     }
+
+    /// 计算 datastore 版本 GC 的安全水位线：**任何活跃事务能看到的版本都 > 返回值**。
+    ///
+    /// 算法（两次扫描 + 中间发布 gc_floor + F_gc）：
+    /// ```text
+    /// proposed      = min(now, first_scan, oracle_now)
+    /// gc_floor.fetch_max(proposed, SeqCst)   // 发布水位线，供 register_counter 事前检查
+    /// fence(SeqCst)                           // F_gc，闭合 Dekker 协议
+    /// cleanup_ts    = min(proposed, second_scan)
+    /// ```
+    ///
+    /// 与 `register_counter` 一起维护不变式：本轮回收后仍能注册成功的事务，
+    /// 其 version 必然 > cleanup_ts。两次扫描 + gc_floor 保证任何并发注册的
+    /// 事务要么被第二次扫描看见（水位被压低），要么在 `register_counter` 里
+    /// 读到 `gc_floor > v` 主动 rollback。
+    ///
+    /// `proposed` 必须 cap 到 `oracle_now`：idle 数据库下 wall clock 会推进但
+    /// Oracle 时间戳不动，不 cap 会让 `gc_floor` 永远超过任何新事务能拿到的
+    /// version，注册陷入死循环。
+    ///
+    /// 详见 `docs/005_version_history_gc.md`。
+    pub(crate) fn compute_cleanup_ts(&self) -> u64 {
+        let now = self.oracle.current_time_ns();
+        let earliest_tx = self.earlist_active_version(now);
+        let oracle_now = self.oracle.inner.timestamp.load(Ordering::SeqCst);
+
+        let proposed = now.min(earliest_tx).min(oracle_now);
+        self.gc_floor.fetch_max(proposed, Ordering::SeqCst);
+        fence(Ordering::SeqCst);   // F_gc
+
+        let earliest_after = self.earlist_active_version(now);
+        proposed.min(earliest_after)
+    }
+
+    /// 全量版本 GC：遍历 datastore 每个 key，就地压缩版本链，空版本链摘除 entry。
+    /// 增量路径 (`run_gc_dirty_inner`) 的兜底，覆盖冷 key 与纯 tombstone 僵尸 entry。
+    ///
+    /// **entry.remove() 与写路径的握手**：`entry.remove()` 必须在持有 `versions` 写锁时调用，
+    /// 与 `TransactionInner::commit` 中"拿到写锁 → 检查 `entry.is_removed()` → 重试"的
+    /// 循环相呼应：写路径可能已通过 `get_or_insert_with` 拿到同一个 entry 但尚未取锁，
+    /// GC 在写锁保护下摘除后，写路径拿到锁时会看到 `is_removed()` 为 true 并重新走
+    /// `get_or_insert_with` 拿到新 entry，避免把数据写入即将被回收的节点。
+    pub(crate) fn run_gc_full(&self, cleanup_ts: u64) {
+        for entry in self.datastore.iter() {
+            let mut versions = entry.value().write();
+            if versions.gc_older_versions(cleanup_ts) == 0 {
+                entry.remove();
+            }
+        }
+    }
+
+    /// 增量版本 GC：只处理 `gc_dirty_keys` 队列中最近有写入的 key。
+    /// HashSet 去重：同一 key 在一轮内可能被多次提交、多次入队，只 GC 一次。
+    pub(crate) fn run_gc_dirty_inner(&self, cleanup_ts: u64) {
+        let mut seen = HashSet::new();
+        while let Some(key) = self.gc_dirty_keys.pop() {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            self.gc_key(&key, cleanup_ts);
+        }
+    }
+
+    /// 对单个 key 压缩版本链；空链则从 datastore 摘除 entry。
+    /// key 已不在 datastore 时（前一轮已摘除等），静默返回。
+    /// entry.remove() 必须在持有 `versions` 写锁时调用，参见 `run_gc_full` 的说明。
+    fn gc_key(&self, key: &Bytes, cleanup_ts: u64) {
+        if let Some(entry) = self.datastore.get(key) {
+            let mut versions = entry.value().write();
+            if versions.gc_older_versions(cleanup_ts) == 0 {
+                entry.remove();
+            }
+        }
+    }
 }
 
-/// 扫描 `counter_by_commit`，返回最早的活跃 commit id。
+/// GC 水位线扫描原语：遍历 counter map 返回首个活跃 key（即最早活跃 commit/version），
+/// map 为空则返回 `fallback`。被 `earliest_active_commit` / `earlist_active_version` 共用。
 ///
-/// # 并发正确性（Dekker 风格双 fence 协议）
+/// 入口的 `fence(SeqCst)` 是 Dekker 双 fence 协议的 GC 半边（`F_gc`），
+/// 与 `register_counter` 中的 `F_tx` 一起保证：任何注册成功的活跃事务 TX，
+/// 只要 GC 端读到 `fallback > TX.snapshot`，就必然能读到 `counter[snapshot] >= 1`。
+/// 缺 fence 会在弱内存序架构上读到过期的 counter=0，误删活跃事务需要的数据。
 ///
-/// GC 必须维护的安全不变式：对任何"注册已完成、快照起点为 v"的活跃事务 TX，
-///
-/// ```text
-///     若本次扫描读到 fallback > v ⟹ 必然读到 counter[v] >= 1
-/// ```
-///
-/// 违反该不变式意味着 GC 会用 fallback 当水位线，把 `commit_queue` 中
-/// `(v, fallback)` 区间的记录当作过期数据删掉，而这些正是 TX 提交时
-/// 做冲突检测要扫描的记录——一旦被并发误删，会导致写写/写读冲突静默漏检，
-/// 出现 lost update / write skew 等正确性 bug。
-///
-/// TX 侧（见 `register_counter`）通过 "CAS → F_tx → reload commit_id" 承诺：
-/// **若 TX 注册成功，则它的 CAS 在 SC 全局序上早于任何后续把 commit_id 抬高的写。**
-///
-/// 但这只是 TX 端对自己行为的承诺，GC 想利用它必须把自己的两次 load 也
-/// 串成 SC 有序——这就是本函数入口 `F_gc` 的职责：
-///
-/// ```text
-///     TX:    CAS counter[v]=1 ── F_tx ── reload commit_id (== v)
-///                                                 ↑ SC 全局序
-///     Cmt:   commit_id: v → v+1                   │
-///                                                 ↓
-///     GC:    load fallback ── F_gc ── load counter[v]
-/// ```
-///
-/// 当 GC 读到 `fallback > v` 时，Committer 的写必然排在 GC 的 fallback load 之前，
-/// 也必然排在 TX 的 reload 之后；`F_tx` 与 `F_gc` 一起把 TX 的 CAS 钉在
-/// GC 的 counter load 之前，Acquire load 因此一定能观察到 `counter[v] >= 1`。
-///
-/// # 场景 1：注册完成的事务，GC 一定看见
-///
-/// ```text
-///     TX-A: CAS counter[5]=1 (Release) ── F_tx ── reload commit_id=5 ✓ 返回
-///     Cmt:                                        commit_id: 5 → 6
-///     GC:                                                     load fallback=6 (SC)
-///                                                             F_gc
-///                                                             load counter[5] → 1 (Acquire)
-/// ```
-///
-/// fallback=6 > TX-A 的快照 5；双 fence 把 TX-A 的 CAS 钉在 GC 的 counter load 之前，
-/// GC 判定 5 号活跃，`oldest=5`，只删 `commit_queue` 中 `< 5` 的记录，
-/// TX-A 提交时扫描 `> 5` 的区间不受影响。
-///
-/// # 场景 2：注册未完成的事务，GC 看不到也安全
-///
-/// ```text
-///     TX-B: load commit_id=5
-///           CAS counter[5]=1  ← 尚未执行
-///     GC:                     load fallback=5 (SC)
-///                             F_gc
-///                             load counter[5] → 0（此 slot 甚至可能不存在）
-///                             ⇒ oldest = fallback = 5，删 < 5 的记录
-///     TX-B:                   继续执行 CAS、F_tx、reload=5 ✓ 返回
-/// ```
-///
-/// TX-B 后续注册成功时，其快照仍为 5，需要扫描的区间是 `> 5`；
-/// GC 删的是 `< 5` 的记录，与 TX-B 的扫描区间无交集。
-/// 只要 TX-B 观察到"commit_id 稳定为 5"这个事实存在，`fallback` 就不可能小于 5，
-/// 所以 GC 走 fallback 兜底始终安全。
-///
-/// # 场景 3：缺失 `F_gc` 时的乱序（弱内存序架构上）
-///
-/// ```text
-///     TX-A: CAS counter[5]=1 (Release) ── F_tx ── reload commit_id=5 ✓ 返回
-///     Cmt:                                        commit_id: 5 → 6
-///     GC:                                                     load fallback=6
-///                                                             (无 F_gc)
-///                                                             load counter[5] → 0 (stale)
-/// ```
-///
-/// GC 的 counter Acquire load 与 fallback SC load 之间没有强制顺序，
-/// 可以从本地缓存读到"初始 0"而未观察到 TX-A 的 Release。GC 判定"5 号无人"，
-/// 用 fallback=6 兜底，删除 `commit_queue` 中 key `< 6` 的记录——
-/// **TX-A 提交时 `range(6..)` 扫不到冲突源，冲突检测静默失效**。
-///
-/// # 其它细节
-///
-/// - 跳过 `counter == 0` 或 `COUNTER_TOMBSTONE`：这些 slot 正在退场
-///   （已归零或已打墓碑等待被摘除），不代表当前活跃事务。
+/// 完整证明见 `docs/004_commit_queue_gc.md`。
 #[inline]
 fn earliest_active(map: &SkipMap<u64, Arc<AtomicU64>>, fallback: u64) -> u64 {
-    fence(Ordering::SeqCst);
+    fence(Ordering::SeqCst);   // F_gc
     for entry in map.iter() {
         let c = entry.value().load(Ordering::Acquire);
+        // 跳过归零 / 墓碑 slot（正在退场，不代表活跃事务）
         if c != 0 && c != COUNTER_TOMBSTONE {
             return *entry.key();
         }

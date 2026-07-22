@@ -104,6 +104,19 @@ impl Versions {
         IndexOrUpdate::Index(idx)
     }
 
+	/// 按索引区间删除内部版本；容量远大于长度时触发 `shrink_to_fit`。
+	/// 阈值 `len.max(4) * 2` 保留 SmallVec 内联的 4 个 slot，避免 inline/heap 抖动。
+	#[inline]
+	pub fn drain<R>(&mut self, range: R)
+	where
+		R: std::ops::RangeBounds<usize>
+	{
+		self.inner.drain(range);
+		if self.inner.capacity() > self.inner.len().max(4).saturating_mul(2) {
+			self.inner.shrink_to_fit();
+		}
+	}
+
     /// 返回从左到右，返回idx，[0, idx) 是小于version的版本号 [idx, self.inner.len()) 是大于等于version的版本号, idx 为0表示没有找到小于version的版本号
     /// 当返回的长度等于self.inner.len()时，version大于所有版本号，所以就指向len()也就是 idx + 1
     #[inline]
@@ -169,6 +182,35 @@ impl Versions {
             false
         }
     }
+
+	/// 就地压缩版本链：丢弃所有活跃事务不可见的旧版本，返回压缩后的版本数。
+	///
+	/// 入参 `version` 是 GC 水位线 `cleanup_ts`（详见 `Inner::compute_cleanup_ts`），
+	/// 保证任何活跃事务的快照都 `> version`。
+	///
+	/// 保留规则（`lte = find_index_lte_version(version)`，`visible = lte - 1`）：
+	/// - `lte == 0`：所有版本都 `> version`，无可回收；
+	/// - `versions[visible]` 是 tombstone：整条 `..lte` 全丢（活跃事务看到的就是"已删除"，
+	///   等价于 key 不存在；版本链为空后调用方摘除 datastore entry）；
+	/// - 否则：保留 `visible` 这条"水位线下最新可见值"，丢弃 `..visible`。
+	#[inline]
+	pub(crate) fn gc_older_versions(&mut self, version: u64) -> usize {
+		let lte = self.find_index_lte_version(version);
+		if lte == 0 {
+			return self.inner.len();
+		}
+
+		let visible = lte - 1;
+		if self.inner[visible].value.is_none() {
+			// tombstone：连它一起丢，版本链为空后调用方会摘除 entry
+			self.drain(..lte);
+		} else {
+			// 保留 visible，丢弃更旧的历史
+			self.drain(..visible);
+		}
+
+		self.inner.len()
+	}
 }
 
 #[cfg(test)]

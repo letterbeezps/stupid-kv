@@ -24,16 +24,15 @@ pub(crate) struct TransactionInner {
     /// 该事务创建时db的commit ID，由db::Inner::transaction_commit_id
     pub(crate) commit: u64,
     /// 本事务在 `counter_by_commit[commit]` 上共享的引用计数。
-    ///
-    /// - 多个并发事务若读到同一 `transaction_commit_id`，会共享同一个 counter；
-    /// - 事务创建时由 `register_counter` 完成 +1；
-    /// - 事务销毁时由 `release_counter` 完成 -1，减到 0 则打上墓碑并由 `Transaction::drop`
-    ///   将对应 entry 从 `counter_by_commit` 中摘除。
-    /// GC 通过该 counter 判定：只要它非零，就说明还有事务把 `commit` 当作快照起点，
-    /// `<= commit` 的 commit queue entry 都不可以被回收。
+    /// 多个并发事务读到同一 commit id 时共享同一 counter；Drop 时 -1，归零则打墓碑并摘除 map entry。
+    /// 只要它非零，commit queue GC 就不会回收 `< commit` 的 commit queue entry。
     pub(crate) counter_commit: Arc<AtomicU64>,
     /// 该事务创建时db的数据的当前版本号，由db::Inner::Oracle分配
     pub(crate) version: u64,
+    /// 本事务在 `counter_by_oracle[version]` 上共享的引用计数。
+    /// 结构与 `counter_commit` 对称，服务于 datastore 版本 GC：
+    /// 只要它非零，`<= version` 的可见版本就必须保留，否则本事务的快照读会破损。
+    pub(crate) counter_version: Arc<AtomicU64>,
     /// 该事务读取的键值对的键集合
     pub(crate) readset: HashSet<Bytes>,
     /// 该事务读取的键值对的键集合的布隆过滤器
@@ -44,103 +43,39 @@ pub(crate) struct TransactionInner {
     pub(crate) database: Arc<Inner>,
 }
 
-/// 为新事务在 `counter_by_commit` 上注册一次引用，返回读到的 commit id 以及共享的 counter。
+/// 事务侧向 GC 登记快照：读 atomic → 在 `map[v]` 上 CAS +1 → 返回 `(v, counter)`。
+/// 被两条 GC 协议共用：
+/// - `counter_by_commit` / `transaction_commit_id`：commit queue GC；
+/// - `counter_by_oracle` / `oracle.timestamp`：datastore 版本 GC（需传 `gc_floor`）。
 ///
-/// # 目标
-///
-/// 该函数需要在 `transaction_commit_id` 存在并发写入（`atomic_commit` 会 `fetch_add`）
-/// 的前提下，保证：
-/// 1. 返回的 `(commit, counter)` 满足：`counter` 就是 `counter_by_commit[commit]` 当前活跃的那一份；
-/// 2. 不会误"复活"一个已经被打上墓碑、正等待被 `Transaction::drop` 从 map 中摘除的 counter；
-/// 3. 与 GC 侧的 `earliest_active` 扫描配对，共同维护 GC 的安全不变式：
-///    ```text
-///        GC 读到 fallback > v ⟹ GC 一定读到 counter[v] >= 1
-///    ```
-///    从而 GC 不会把本事务提交时还要扫描的 `commit_queue` 记录当作过期数据回收。
-///
-/// # 与 GC 端的 Dekker 协议
-///
-/// 本函数是这个跨线程协议的"写侧半边"，GC 端在 `earliest_active` 中提供"读侧半边"：
+/// 与 GC 侧 `earliest_active` 一起维护不变式：
 ///
 /// ```text
-///     TX (register_counter)                GC (earliest_active)
-///     ─────────────────────                ────────────────────
-///     A. load commit_id → v                X. load commit_id → fallback  (SC)
-///     B. CAS counter[v]: 0 → 1  (Release)  Y. fence(SeqCst)  [F_gc]
-///     C. fence(SeqCst)  [F_tx]             Z. load counter[v] (Acquire)
-///     D. reload commit_id (必须仍 = v)
+///     对任何注册成功、快照为 v 的活跃事务 TX，
+///     若 GC 读到 fallback > v ⟹ GC 必然读到 counter[v] >= 1。
 /// ```
 ///
-/// 关键论证：若 GC 读到 `fallback > v`，则在 SC 全局序中：
-/// 1. Committer 的 `commit_id: v → v+_` 排在 X 之前；
-/// 2. 由 D 的稳定性检查（reload 仍见 v），Committer 的写又必然排在 D 之后，
-///    因此也排在 `F_tx` 之后；
-/// 3. `F_tx` 与 `F_gc` 一起把 B 的 CAS 钉在 Z 的 Acquire load 之前；
-/// 4. Acquire load 因此一定看到 `counter[v] >= 1`。
+/// 实现要点：
+/// 1. **CAS 后插 `F_tx` 再 reload atomic**：与 GC 侧的 `F_gc` 配对形成 Dekker 双 fence 协议，
+///    把 TX 的 CAS 钉在 GC 的 counter load 之前。
+/// 2. **`gc_floor` 事前检查**（仅 version GC 场景）：若 GC 已把 v 判死，主动 rollback 重试。
+///    commit queue GC 不存在"GC 决定回收某 commit 后新事务恰好拿到它"的问题，传 `None`。
+/// 3. **墓碑处理**：见到 `COUNTER_TOMBSTONE` 的 slot 直接放弃、下一轮循环重取——
+///    该 slot 正在退场，在其上 +1 会破坏不变式。
+/// 4. **rollback 时的 remove 用 `Arc::ptr_eq` 校验**：防止误删已被替换成新 counter 的同 key entry。
 ///
-/// `F_tx` 让本线程的 CAS 在 SC 全局序上排在 reload 之前，具体是否被 GC 观察到还依赖
-/// GC 侧的 `F_gc` 把它的两次 load 也钉进 SC 全局序。两个 fence 缺一不可。
-///
-/// # 场景 1：注册在 fallback 推进之前完成
-///
-/// ```text
-///     TX-A: load commit_id=5
-///           CAS counter[5]=1
-///           F_tx
-///           reload commit_id=5 ✓ 返回
-///     Cmt:                       commit_id: 5 → 6
-///     GC:                                       load fallback=6
-///                                               F_gc
-///                                               load counter[5] → 1
-/// ```
-///
-/// fallback=6 > TX-A 的快照 5；双 fence 把 TX-A 的 CAS 钉在 GC 的 counter load 之前，
-/// GC 判定 5 号活跃，`oldest=5`，TX-A 需要扫描的 `> 5` 区间被完整保留。
-///
-/// # 场景 2：注册途中 commit_id 被抬高，reload 失败重试
-///
-/// ```text
-///     TX-A: load commit_id=5
-///           CAS counter[5]=1
-///           F_tx
-///     Cmt:  commit_id: 5 → 6
-///     TX-A: reload commit_id=6 ≠ 5 ✗
-///           → release_counter(counter[5])  // 撤销 +1
-///           → 若归零，摘除 map[5]
-///           → 回到 loop 头
-///           load commit_id=6
-///           CAS counter[6]=1
-///           F_tx
-///           reload commit_id=6 ✓ 返回
-/// ```
-///
-/// 撤销时用 `Arc::ptr_eq` 校验 map 中 key=5 上仍是同一个 counter，
-/// 防止误删已被后来者替换成新 counter 的同 key entry。
-///
-/// # 场景 3：GC 与注册并发交错，未完成的注册被兜底覆盖
-///
-/// ```text
-///     TX-B: load commit_id=5
-///           CAS counter[5]=1  ← 尚未执行
-///     GC:                     load fallback=5
-///                             F_gc
-///                             load counter[5] → 0（slot 甚至可能不存在）
-///                             ⇒ oldest=5，删 commit_queue 中 < 5 的记录
-///     TX-B:                   继续 CAS、F_tx、reload=5 ✓ 返回
-/// ```
-///
-/// TX-B 后续注册成功时快照仍为 5，其冲突扫描区间是 `> 5`；GC 删的是 `< 5` 的记录，
-/// 与 TX-B 扫描区间无交集。只要 TX-B 最终能观察到"commit_id 在 5 稳定"，
-/// GC 之前读到的 fallback 就不可能小于 5，兜底始终安全。
+/// 完整证明、并发场景演示、失败模式见 `docs/004_commit_queue_gc.md`
+/// 和 `docs/005_version_history_gc.md`。
 #[inline]
 fn register_counter(
     map: &SkipMap<u64, Arc<AtomicU64>>,
     atomic: &AtomicU64,
+    gc_floor: Option<&AtomicU64>
 ) -> (u64, Arc<AtomicU64>) {
     loop {
         let v = atomic.load(Ordering::SeqCst);
         let counter = map.get_or_insert_with(v, || Arc::new(AtomicU64::new(0))).value().clone();
-        // 在 counter 上 CAS +1；墓碑 slot 直接放弃，进入下一轮以拿到新的 counter
+        // 在 counter 上 CAS +1；见到墓碑 slot 直接放弃，下一轮拿新的 counter
         let acquired = loop {
             let current = counter.load(Ordering::SeqCst);
             if current == COUNTER_TOMBSTONE {
@@ -156,17 +91,20 @@ fn register_counter(
         if !acquired {
             continue;
         }
-        // F_tx：与 `earliest_active` 里的 F_gc 配对，构成 Dekker 双 fence 协议。
-        // 让 SC 全局序中形成 "CAS < reload" 的边，再配合 GC 侧的
-        // "fallback load < counter load" 推出 "CAS < GC 的 counter load"，
-        // Acquire load 因此一定看到 counter >= 1。
+        // F_tx：与 `earliest_active` 里的 F_gc 配对，构成 Dekker 双 fence 协议
         fence(Ordering::SeqCst);
         let atomic_stable = atomic.load(Ordering::SeqCst) == v;
-        if atomic_stable {
+        // gc_floor 检查仅在 version GC 场景启用（commit queue GC 传 None）
+        let floor_ok = match gc_floor {
+            Some(floor) => floor.load(Ordering::SeqCst) <= v,
+            None => true,
+        };
+        if atomic_stable && floor_ok {
             return (v, counter);
         }
-        // 期间 commit id 已经推进：撤销本次 +1；若因此归零则把墓碑 slot 从 map 摘除，
-        // 用 `Arc::ptr_eq` 防止误删已经被替换成新 counter 的同 key entry。
+
+        // atomic 已推进 或 v 已被 GC 判死：撤销 +1，归零则从 map 摘除。
+        // Arc::ptr_eq 防止误删已被替换成新 counter 的同 key entry。
         if release_counter(&counter) {
             if let Some(e) = map.get(&v) {
                 if Arc::ptr_eq(e.value(), &counter) {
@@ -174,17 +112,13 @@ fn register_counter(
                 }
             }
         }
-
     }
 }
 
-/// 事务退场时对共享 counter 执行 -1；返回 true 表示 counter 已被打上墓碑，
-/// 由调用方负责把对应 entry 从 `counter_by_commit` 中摘除。
-///
-/// - `current > 1`：普通递减，counter 仍有其他活跃事务持有；
-/// - `current == 1`：这是最后一个持有者，直接 CAS 到 `COUNTER_TOMBSTONE`，
-///   墓碑保证后续再看到该 slot 的 `register_counter` 不会将其复活；
-/// - CAS 失败则重试，保证 -1/墓碑化操作最终成功。
+/// 对共享 counter 执行 -1；返回 true 表示归零并已打墓碑，调用方负责从 map 摘除对应 entry。
+/// - `> 1`：普通递减；
+/// - `== 1`：最后一个持有者，CAS 到 `COUNTER_TOMBSTONE`，阻止 `register_counter` 复活；
+/// - CAS 失败重试直至成功。
 #[inline]
 pub(crate) fn release_counter(counter: &AtomicU64) -> bool {
     loop {
@@ -210,11 +144,12 @@ pub(crate) fn release_counter(counter: &AtomicU64) -> bool {
 
 impl TransactionInner {
     pub(crate) fn new(db: Arc<Inner>, write: bool) -> Self {
-        let version = db.oracle.current_timestamp();
-        // 通过 register_counter 同时读取快照起点 commit 并在 counter_by_commit 上 +1，
-        // 保证本事务对 GC 立即可见——GC 不会在事务生命周期内把 `<= commit` 的
-        // commit queue entry 误当作过期数据回收掉。
-        let (commit, counter_commit) = register_counter(&db.counter_by_commit, &db.transaction_commit_id);
+        // 在 counter_by_oracle 上 +1 登记本事务的快照 version，供 datastore 版本 GC 保护。
+        // 传入 &db.gc_floor：若 GC 已把 v 判死，register_counter 会内部重试拿更新的时间戳。
+        let (version, counter_version) = register_counter(&db.counter_by_oracle, &db.oracle.inner.timestamp, Some(&db.gc_floor));
+        // 在 counter_by_commit 上 +1 登记本事务的快照 commit，供 commit queue GC 保护。
+        // commit queue GC 不需要 gc_floor 事前检查，传 None。
+        let (commit, counter_commit) = register_counter(&db.counter_by_commit, &db.transaction_commit_id, None);
 
         Self {
             mode: IsolationLevel::SnapshotIsolation,
@@ -223,6 +158,7 @@ impl TransactionInner {
             commit,
             counter_commit,
             version,
+            counter_version,
             readset: HashSet::new(),
             readeset_bloom: Mutex::new(BloomFilter::new()),
             writeset: BTreeMap::new(),
@@ -320,9 +256,10 @@ impl TransactionInner {
             // 并发安全设计
             // 1: 两个commit 并发写入同一个不存在的key
             // 2: 单个commit 写入一个已经存在的key，但是中途遇到
+            // 3: 与版本 GC 摘除同 key entry 的竞争
             let value = value.clone();
             loop {
-                let entry = 
+                let entry =
                     self
                     .database
                     .datastore
@@ -332,16 +269,23 @@ impl TransactionInner {
                             value: value.clone(),
                         }))
                     });
-                let mut versions = 
+                let mut versions =
                     entry
                     .value()
                     .write();
+                // 与版本 GC 的握手协议：`Inner::run_gc_full` / `gc_key` 摘除空版本链
+                // 的 entry 时必须持有此 `versions` 写锁，因此这里拿到锁之后再检查
+                // `is_removed()` 就能可靠判断该 entry 是否已经被 GC 判死；若已判死，
+                // 重试从 `get_or_insert_with` 开始，拿到新 entry 后再写入，
+                // 避免把数据写入即将从 datastore 中被摘除的节点、丢失本次提交。
                 if entry.is_removed() {
                     continue;
                 }
                 versions.push(Version { version, value });
                 break;
             }
+            // 把写入 key 推入版本 GC 的增量脏队列，供 `run_gc_dirty_inner` 消费
+            self.database.gc_dirty_keys.push(key.clone());
         }
         // 从合并队列中移除数据，此时数据已经写入数据存储，可以安全地移除，合并队列只存储待提交的数据
         self.database.transaction_merge_queue.remove(&version);
