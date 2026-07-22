@@ -74,8 +74,9 @@ Transaction (writeset) → commit queue (conflict check) → merge queue (pendin
 | `0.0.2` | SSI + Bloom filter accelerated conflict detection | ✅ done |
 | `0.0.3` | Runtime hardening (write-path safety, adaptive backoff, Oracle anti-drift) | ✅ done |
 | `0.0.4` | Commit queue GC (active-txn refcount + Dekker double-fence protocol) | ✅ done |
+| `0.0.5` | Version history GC (datastore version-chain compaction, gc_floor + dirty queue + full-scan fallback) | ✅ done |
 
-Rough planning: version-history GC (datastore-side, reuses 0.0.4 watermark), Persistence (WAL/Snapshot).
+Rough planning: Persistence (WAL/Snapshot).
 
 ## Adding a New Section
 
@@ -89,4 +90,4 @@ Rough planning: version-history GC (datastore-side, reuses 0.0.4 watermark), Per
 
 - Diagram labels inside code blocks: **English only**
 - Surrounding prose: Chinese
-- Design docs: `docs/001_basic_transaction.md`, `docs/002_ssi_bloom_filter.md`, `docs/003_runtime_hardening.md`, `docs/004_commit_queue_gc.md`, etc.
+- Design docs: `docs/001_basic_transaction.md`, `docs/002_ssi_bloom_filter.md`, `docs/003_runtime_hardening.md`, `docs/004_commit_queue_gc.md`, `docs/005_version_history_gc.md`, etc.
