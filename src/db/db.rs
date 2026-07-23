@@ -87,6 +87,15 @@ impl Database {
 		self.inner.run_cleanup_inner();
 	}
 
+	/// 手动触发一次 datastore 版本 GC，与后台线程共用同一入口。
+	/// 先算 `cleanup_ts` 水位（所有活跃事务快照的下界），再执行
+	/// 增量 GC（dirty queue）+ 全量 GC 兜底，两步都以该水位为回收上界。
+	pub fn run_gc(&self) {
+		let cleanup_ts = self.compute_cleanup_ts();
+		self.run_gc_dirty_inner(cleanup_ts);
+		self.run_gc_full(cleanup_ts);
+	}
+
 	/// 关停两条后台 GC 线程：置开关 → `unpark` → `join`。
 	/// 未启动的线程（handle 为 None）会被安全跳过。
 	fn shutdown(&self) {

@@ -48,4 +48,16 @@ impl DatabaseOptions {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Builder：覆盖 datastore 版本 GC 扫描周期。
+    pub fn with_gc_interval(mut self, interval: Duration) -> Self {
+        self.gc_interval = interval;
+        self
+    }
+
+    /// Builder：覆盖 commit queue GC 扫描周期。
+    pub fn with_cleanup_interval(mut self, interval: Duration) -> Self {
+        self.cleanup_interval = interval;
+        self
+    }
 }

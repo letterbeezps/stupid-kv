@@ -12,3 +12,6 @@ mod options;
 
 #[doc(inline)]
 pub use self::db::*;
+
+#[doc(inline)]
+pub use self::options::*;
