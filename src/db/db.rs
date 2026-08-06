@@ -2,8 +2,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::{ops::Deref, sync::Arc};
 
+use crate::PersistenceOptions;
 use crate::db::inner::Inner;
 use crate::options::{DEFAULT_CLEANUP_INTERVAL, DEFAULT_GC_FULL_SCAN_FREQUENCY, DEFAULT_GC_INTERVAL, DatabaseOptions};
+use crate::persistence::Persistence;
 use crate::tx::{Transaction, TransactionInner};
 
 
@@ -18,7 +20,15 @@ pub struct Database {
 	gc_interval: Duration,
 
 	/// 每 N 轮增量 GC 触发一次全量 GC；启动时会 clamp 到 `.max(1)` 防 `% 0` 除零。
-	gc_full_scan_frequency: u64
+	gc_full_scan_frequency: u64,
+
+	/// 持久化实例。`None` 表示纯内存运行，不产生任何磁盘 IO。
+	///
+	/// 与 `Inner.persistence` 的双持有：
+	/// - Database 侧持有 `Option<Persistence>`（值语义），Database 的构造 / shutdown 以此为准；
+	/// - Inner 侧持有 `RwLock<Option<Arc<Persistence>>>`（引用语义），供以后其他模块从 Inner
+	///   反向获取 Persistence 引用（如 WAL 模块写日志需要拿 Persistence 路径）。
+	persistence: Option<Persistence>,
 }
 
 impl Default for Database {
@@ -31,6 +41,8 @@ impl Default for Database {
 			gc_interval: DEFAULT_GC_INTERVAL,
 
 			gc_full_scan_frequency: DEFAULT_GC_FULL_SCAN_FREQUENCY,
+
+			persistence: None,
         }
     }
 }
@@ -64,6 +76,7 @@ impl Database {
 			cleanup_interval: opts.cleanup_interval,
 			gc_interval: opts.gc_interval,
 			gc_full_scan_frequency: opts.gc_full_scan_frequency,
+			persistence: None,
 		};
 
 		if opts.enable_cleanup {
@@ -75,6 +88,61 @@ impl Database {
 		}
 
 		db
+	}
+
+	/// 带持久化能力构造 Database：先建 Inner → 建 Persistence（内部 load 恢复快照） →
+	/// 回填 `Inner.persistence` → 最后启动两条 GC 线程。
+	///
+	/// # 顺序约束
+	///
+	/// 两条 GC 线程必须在 `Persistence::new_with_options`（内部会 `load()` 恢复数据）之后再启动，
+	/// 原因：
+	/// - 版本 GC 计算 `cleanup_ts = min(now, earliest_active_version, oracle_now)`；
+	/// - 刚 load 完还没有任何活跃事务注册 counter，`earliest_active_version = now`；
+	/// - 如果此时先启动了 GC 线程，它会把 load 进来的历史版本直接当作"没人引用"一口气清掉，
+	///   导致后续开启的老版本快照事务读不到应有的数据。
+	///
+	/// # 对外签名
+	///
+	/// 返回 `std::io::Result<Self>` 而非 `Result<Self, PersistenceError>`：
+	/// 给调用方一个稳定、不依赖本库内部错误类型的纯 IO 结果（`PersistenceError` 三种变体
+	/// 都通过 `std::io::Error::other` 包一层）。
+	pub fn new_with_persistence(
+		opts: DatabaseOptions,
+		persistence_opts: PersistenceOptions,
+	) -> std::io::Result<Self> {
+		let inner = Arc::new(Inner::new(&opts));
+
+		// Persistence::new_with_options 内部顺序：
+		//   1) create_dir_all(base_path / snapshot_path)
+		//   2) load() 从快照文件恢复 datastore
+		//   3) spwan_snapshot_worker() 起后台周期快照线程（Interval 模式）
+		let persist = Persistence::new_with_options(persistence_opts, inner.clone())
+			.map_err(std::io::Error::other)?;
+
+		// 双持有：Inner 也保存一份 Arc<Persistence> 引用，便于以后 WAL 等模块从 Inner 侧拿到。
+		// 使用 Arc 而非值：Persistence 实现了 Clone（内部所有字段都是 Arc/RwLock 包装），
+		// clone 出来的实例共享同一份 snapshot_handle / background_threads_enabled。
+		inner.persistence.write().replace(Arc::new(persist.clone()));
+
+		let db = Database {
+			inner,
+			cleanup_interval: opts.cleanup_interval,
+			gc_interval: opts.gc_interval,
+			gc_full_scan_frequency: opts.gc_full_scan_frequency,
+			persistence: Some(persist),
+		};
+
+		// ★ 关键顺序：load 完、对外构造快完成时才启动 GC 线程，避免 GC 误收 load 进来的历史版本
+		if opts.enable_cleanup {
+			db.intialise_cleanup_worker();
+		}
+
+		if opts.enable_gc {
+			db.initialise_garbage_worker();
+		}
+
+		Ok(db)
 	}
 
     pub fn transaction(&self, write: bool) -> Transaction {
@@ -96,17 +164,42 @@ impl Database {
 		self.run_gc_full(cleanup_ts);
 	}
 
-	/// 关停两条后台 GC 线程：置开关 → `unpark` → `join`。
-	/// 未启动的线程（handle 为 None）会被安全跳过。
+	/// 关停所有后台线程：
+	///
+	/// # 顺序（先关读线程再关写线程）
+	/// 1. snapshot worker（读 datastore versions 链做序列化）—— 先关，保证最后一次 snapshot
+	///    看到的版本链是完整的（GC 线程还没进场裁版本）；
+	/// 2. commit queue GC（删 commit_queue 历史 entry）；
+	/// 3. datastore 版本 GC（裁 versions 链 + 摘除空 entry）。
+	///
+	/// 每条线程同一套 shutdown 协议：`store(false)` 置开关 → `unpark` 唤醒 park → `join` 等待退出。
+	/// 未启动的线程（handle 为 None）被 `take()` 拿到 None 后安全跳过。
 	fn shutdown(&self) {
-		self.background_threads_enabled.store(false, Ordering::Relaxed);
-		if let Some(handle) = self.transaction_cleanup_handle.write().take() {
-			handle.thread().unpark();
-			let _ = handle.join();
+
+		{
+			// 阶段 1：先关 snapshot worker（读线程）
+			if let Some(ref persistence) = self.persistence {
+				persistence.background_threads_enabled.store(false, Ordering::Release);
+
+				// 等待快照线程完成。同样的操作在 persistence 回收的时候也会执行，作为兜底。
+				if let Some(handle) = persistence.snapshot_handle.write().take() {
+					handle.thread().unpark();
+					let _ = handle.join();
+				}
+			}
 		}
-		if let Some(handle) = self.garbage_collection_handle.write().take() {
-			handle.thread().unpark();
-			let _ = handle.join();
+
+		// 阶段 2 & 3：关两条 GC 线程（写 datastore / commit_queue）
+		self.background_threads_enabled.store(false, Ordering::Relaxed);
+		{
+			if let Some(handle) = self.transaction_cleanup_handle.write().take() {
+				handle.thread().unpark();
+				let _ = handle.join();
+			}
+			if let Some(handle) = self.garbage_collection_handle.write().take() {
+				handle.thread().unpark();
+				let _ = handle.join();
+			}
 		}
 	}
 

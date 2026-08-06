@@ -53,16 +53,6 @@ impl Oracle {
         Arc::new(oracle)
     }
 
-    /// 返回当前的**高水位版本号**，即最近一次成功分配出去的版本。
-    ///
-    /// 事务开启时用它作为快照点：所有 `version <= 该值` 的已提交写入对本事务可见。
-    /// 使用 `Acquire` 语义与提交侧的 `fetch_max(Release)` 配对，保证读到该值时，
-    /// 对应事务的写入在 merge queue 中也已就位（happens-before）。
-    #[inline]
-    pub fn current_timestamp(&self) -> u64 {
-        self.inner.timestamp.load(Ordering::Acquire)
-    }
-
     /// 获取当前**系统墙钟**的 unix 纳秒时间戳。
     ///
     /// 仅用于 [`Oracle::new`] 中初始化锚点；运行期不要用它作为版本号，

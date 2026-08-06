@@ -9,6 +9,7 @@ mod kv;
 mod error;
 mod bloom;
 mod options;
+mod persistence;
 
 #[doc(inline)]
 pub use self::db::*;

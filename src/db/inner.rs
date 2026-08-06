@@ -8,6 +8,7 @@ use crossbeam_queue::SegQueue;
 use crossbeam_skiplist::SkipMap;
 use parking_lot::RwLock;
 
+use crate::persistence::Persistence;
 use crate::{options::DatabaseOptions, oracle::Oracle, queue::{Commit, Merge}, versions::Versions};
 
 /// counter 归零后的墓碑值，`register_counter` 见到墓碑必须放弃该 slot、
@@ -102,6 +103,17 @@ pub struct Inner {
     /// 后台任务运行开关。
     /// Database drop 时被置为 false，后台清理线程读到该标志后退出循环。
     pub(crate) background_threads_enabled: AtomicBool,
+
+    /// 持久化实例引用。与 `Database.persistence` 的双持有：
+    /// - Database 持有 `Option<Persistence>`（值语义），生命周期由 Database 构造 / Drop 管理；
+    /// - Inner 持有 `RwLock<Option<Arc<Persistence>>>`（引用语义），供以后其他模块（如 WAL）
+    ///   从 Inner 侧反向访问 Persistence 的路径 / 配置信息，不需要同时持有 Database 引用。
+    ///
+    /// 包 `RwLock<Option<Arc<...>>>` 三层：
+    /// - `RwLock`：写只发生在 `Database::new_with_persistence` 的构造阶段，读无竞争；
+    /// - `Option`：纯内存模式下为 None，不分配 Persistence；
+    /// - `Arc`：与 Database.persistence 里的值共享同一实例（clone 的是 Arc 引用，不是实例）。
+    pub(crate) persistence: RwLock<Option<Arc<Persistence>>>,
 }
 
 impl Inner {
@@ -121,6 +133,7 @@ impl Inner {
             gc_dirty_keys: SegQueue::new(),
             datastore: SkipMap::new(),
             background_threads_enabled: AtomicBool::new(true),
+            persistence: RwLock::new(None),
         }
     }
 }

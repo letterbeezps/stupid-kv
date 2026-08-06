@@ -183,6 +183,22 @@ impl Versions {
         }
     }
 
+	#[inline]
+	/// 导出完整版本链为可序列化的 `Vec<(u64, Option<Bytes>)>`。
+	///
+	/// 仅快照序列化路径使用；在线读 / 写路径调用的是 `fetch_version` / `exists_version` / `push`。
+	///
+	/// 导出语义（与 load 时 `Versions::push` 对称）：
+	/// - 版本按 `version` 升序排列，与 `push` 后 SmallVec 内部顺序严格一致；
+	/// - 返回值是独立克隆的 Vec，**不依赖调用方持有的 RwLock 读锁**；
+	///   快照线程可以在释放读锁后再做 bincode encode，避免长时间占锁阻塞写路径。
+	pub(crate) fn all_versions(&self) -> Vec<(u64, Option<Bytes>)> {
+		self.inner
+		.iter()
+		.map(|v| (v.version, v.value.clone()))
+		.collect()
+	}
+
 	/// 就地压缩版本链：丢弃所有活跃事务不可见的旧版本，返回压缩后的版本数。
 	///
 	/// 入参 `version` 是 GC 水位线 `cleanup_ts`（详见 `Inner::compute_cleanup_ts`），
