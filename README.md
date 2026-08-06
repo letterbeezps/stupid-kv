@@ -21,6 +21,7 @@
 | [`0.0.3`](https://github.com/letterbeezps/stupid-kv/tree/0.0.3) | Section 0.0.3 — 运行时鲁棒性加固 | 写路径并发安全（封堵静默丢数据窗口），auto_commit / atomic_merge 自适应退避，Oracle 后台 resync 抗时钟漂移，DatabaseOptions 参数入口 |
 | [`0.0.4`](https://github.com/letterbeezps/stupid-kv/tree/0.0.4) | Section 0.0.4 — 提交队列 GC | 活跃事务引用计数 `counter_by_commit`，Dekker 风格双 fence 协议（`register_counter` ↔ `earliest_active`），后台清理线程 + 优雅停机，避免 `transaction_commit_queue` 无限增长 |
 | [`0.0.5`](https://github.com/letterbeezps/stupid-kv/tree/0.0.5) | Section 0.0.5 — 版本历史 GC | 复用 0.0.4 引用计数框架扩到 datastore：`counter_by_oracle` + `gc_floor` 事前警告线拦截"新事务落到被回收版本"的竞争，增量 `gc_dirty_keys` 队列 + 周期性全量兜底，`Versions::gc_older_versions` 就地压缩版本链，与 write-path `is_removed()` 握手协议衔接 |
+| [`0.0.6`](https://github.com/letterbeezps/stupid-kv/tree/0.0.6) | Section 0.0.6 — 快照持久化 | 全量快照持久化：`Persistence` 模块 + `SnapshotMode` 配置，`tmp → rename → sync_all` 三段式原子落盘协议，bincode 流式序列化 / 反序列化，后台周期快照线程，`Database::new_with_persistence` 构造 + 三阶段 shutdown 顺序 |
 
 ## 学习笔记
 
@@ -33,6 +34,7 @@
 | 运行时鲁棒性加固 | [003_runtime_hardening.md](docs/003_runtime_hardening.md) | `0.0.3` |
 | 提交队列 GC | [004_commit_queue_gc.md](docs/004_commit_queue_gc.md) | `0.0.4` |
 | 版本历史 GC | [005_version_history_gc.md](docs/005_version_history_gc.md) | `0.0.5` |
+| 快照持久化 | [006_snapshot.md](docs/006_snapshot.md) | `0.0.6` |
 
 ### 番外篇
 
@@ -46,7 +48,7 @@
 
 这些是我接下来想学习的内容，进度可能会比较慢，也可能随时调整：
 
-- **持久化** — WAL / Snapshot 持久化到磁盘
+- **持久化** — WAL（Write-Ahead Log）增量日志，缩小崩溃丢失窗口
 - ...以及更多可能的优化方向
 
 ## 快速开始
@@ -65,19 +67,20 @@ cargo test
 这是我目前理解的数据库架构，可能存在理解不准确的地方：
 
 ```
-                     ┌──────────────────────────────────┐
-                     │         Database                 │
-                     │  Arc<Inner>                      │
-                     │                                  │
-                     │  Oracle ── global clock          │
-                     │  commit queue                    │
-                     │  merge queue                     │
-                     │  datastore                       │
-                     │  counter_by_commit ── active tx  │
-                     │  counter_by_oracle ── active ver │
-                     │  cleanup worker    ── GC thread  │
-                     │  gc worker         ── GC thread  │
-                     └───────────┬──────────────────────┘
+                     ┌──────────────────────────────────────┐
+                     │         Database                     │
+                     │  Arc<Inner>                          │
+                     │                                      │
+                     │  Oracle ── global clock              │
+                     │  commit queue                        │
+                     │  merge queue                         │
+                     │  datastore                           │
+                     │  counter_by_commit ── active tx      │
+                     │  counter_by_oracle ── active ver     │
+                     │  cleanup worker    ── GC thread      │
+                     │  gc worker         ── GC thread      │
+                     │  persistence       ── snapshot       │
+                     └───────────┬──────────────────────────┘
                                  │ shared ref
                                  ▼
                      ┌──────────────────────────┐
@@ -87,6 +90,13 @@ cargo test
                      │  readset: read keys      │
                      │  writeset: local mods    │
                      │  get/set/del             │
+                     └──────────────────────────┘
+
+                     ┌──────────────────────────┐
+                     │      Persistence         │
+                     │  snapshot() ── disk dump  │
+                     │  load() ── restore        │
+                     │  snapshot worker thread   │
                      └──────────────────────────┘
 ```
 
@@ -102,8 +112,9 @@ stupid-kv/
 │   ├── versions/     # 多版本数据管理
 │   ├── queue/          # 提交队列与合并队列
 │   ├── kv/             # key/value 类型转换
-│   ├── options/      # 运行时参数入口 DatabaseOptions
-│   └── error/        # 错误类型定义
+│   ├── options/        # 运行时参数入口 DatabaseOptions + PersistenceOptions
+│   ├── persistence/    # 快照持久化模块（snapshot/load/后台线程）
+│   └── error/          # 错误类型定义（TxError + PersistenceError）
 │   └── lib.rs
 ├── examples/       # 示例代码
 ├── docs/           # 学习笔记
