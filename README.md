@@ -22,6 +22,7 @@
 | [`0.0.4`](https://github.com/letterbeezps/stupid-kv/tree/0.0.4) | Section 0.0.4 — 提交队列 GC | 活跃事务引用计数 `counter_by_commit`，Dekker 风格双 fence 协议（`register_counter` ↔ `earliest_active`），后台清理线程 + 优雅停机，避免 `transaction_commit_queue` 无限增长 |
 | [`0.0.5`](https://github.com/letterbeezps/stupid-kv/tree/0.0.5) | Section 0.0.5 — 版本历史 GC | 复用 0.0.4 引用计数框架扩到 datastore：`counter_by_oracle` + `gc_floor` 事前警告线拦截"新事务落到被回收版本"的竞争，增量 `gc_dirty_keys` 队列 + 周期性全量兜底，`Versions::gc_older_versions` 就地压缩版本链，与 write-path `is_removed()` 握手协议衔接 |
 | [`0.0.6`](https://github.com/letterbeezps/stupid-kv/tree/0.0.6) | Section 0.0.6 — 快照持久化 | 全量快照持久化：`Persistence` 模块 + `SnapshotMode` 配置，`tmp → rename → sync_all` 三段式原子落盘协议，bincode 流式序列化 / 反序列化，后台周期快照线程，`Database::new_with_persistence` 构造 + 三阶段 shutdown 顺序 |
+| [`0.0.7`](https://github.com/letterbeezps/stupid-kv/tree/0.0.7) | Section 0.0.7 — LZ4 快照压缩 | 透明压缩层：`CompressionMode` 两态枚举（None/Lz4），`CompressedWriter` / `CompressedReader` 封装压缩细节，LZ4 level 7 压缩算法，基于 magic number 的自动格式探测，向后兼容 0.0.6 未压缩快照 |
 
 ## 学习笔记
 
@@ -35,6 +36,7 @@
 | 提交队列 GC | [004_commit_queue_gc.md](docs/004_commit_queue_gc.md) | `0.0.4` |
 | 版本历史 GC | [005_version_history_gc.md](docs/005_version_history_gc.md) | `0.0.5` |
 | 快照持久化 | [006_snapshot.md](docs/006_snapshot.md) | `0.0.6` |
+| LZ4 快照压缩 | [007_lz4_compression.md](docs/007_lz4_compression.md) | `0.0.7` |
 
 ### 番外篇
 
@@ -48,7 +50,8 @@
 
 这些是我接下来想学习的内容，进度可能会比较慢，也可能随时调整：
 
-- **持久化** — WAL（Write-Ahead Log）增量日志，缩小崩溃丢失窗口
+- **WAL（Write-Ahead Log）** — 增量日志缩小崩溃丢失窗口
+- **快照格式加固** — Magic + Version + CRC32 校验，跨架构可交换
 - ...以及更多可能的优化方向
 
 ## 快速开始
@@ -80,6 +83,7 @@ cargo test
                      │  cleanup worker    ── GC thread      │
                      │  gc worker         ── GC thread      │
                      │  persistence       ── snapshot       │
+                     │  compression       ── LZ4           │
                      └───────────┬──────────────────────────┘
                                  │ shared ref
                                  ▼
@@ -98,6 +102,13 @@ cargo test
                      │  load() ── restore        │
                      │  snapshot worker thread   │
                      └──────────────────────────┘
+
+                     ┌──────────────────────────┐
+                     │      Compression         │
+                     │  CompressedWriter ── LZ4 │
+                     │  CompressedReader ── det │
+                     │  CompressionMode cfg     │
+                     └──────────────────────────┘
 ```
 
 ## 项目结构
@@ -114,6 +125,7 @@ stupid-kv/
 │   ├── kv/             # key/value 类型转换
 │   ├── options/        # 运行时参数入口 DatabaseOptions + PersistenceOptions
 │   ├── persistence/    # 快照持久化模块（snapshot/load/后台线程）
+│   ├── compression/    # LZ4 压缩模块（CompressedWriter/Reader + auto-detect）
 │   └── error/          # 错误类型定义（TxError + PersistenceError）
 │   └── lib.rs
 ├── examples/       # 示例代码
