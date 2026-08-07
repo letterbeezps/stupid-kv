@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Tutorial project: an incremental Rust implementation of an MVCC key-value database, based on [`surrealdb/surrealmx`](https://github.com/surrealdb/surrealmx). Each completed section gets a git tag.
 
 - **Language:** Rust (2021 edition)
-- **Storage:** In-memory only
+- **Storage:** In-memory with full-state snapshot persistence (bincode + optional LZ4 compression)
 - **Concurrency:** MVCC with Snapshot Isolation (SI) and Serializable Snapshot Isolation (SSI)
 
 ## Commands
@@ -44,6 +44,8 @@ Transaction (writeset) → commit queue (conflict check) → merge queue (pendin
 - **`Versions`** (`src/versions/versions.rs`) — sorted `SmallVec<[Version; 4]>` of `(version: u64, value: Option<Bytes>)`. `None` is a tombstone. `fetch_version(v)` returns the newest value with version ≤ v.
 - **`Commit`** (`src/queue/commit.rs`) — writeset snapshot stored in commit queue; carries a `BloomFilter` over write keys and `(min_key, max_key)` for fast range skipping during conflict detection.
 - **`BloomFilter`** (`src/bloom/bloom.rs`) — fixed 512-byte (4096-bit) filter using FNV-1a + Kirsch-Mitzenmacher double hashing (k=3). Used to accelerate conflict detection on both writesets and readsets.
+- **`Persistence`** (`src/persistence/persistence.rs`) — full-state snapshot facade; holds `Arc<Inner>`, snapshot path, mode, compression mode, background thread handles. Provides `snapshot()` manual trigger and `load()` startup recovery.
+- **`CompressedWriter` / `CompressedReader`** (`src/compression/compression.rs`) — transparent compression wrappers; auto-detect LZ4 format via magic number `0x04224D18`; types erased through `Box<dyn Write>` / `Box<dyn Read>`.
 
 ### Two IDs: `commit` vs `version`
 
@@ -66,6 +68,35 @@ Transaction (writeset) → commit queue (conflict check) → merge queue (pendin
 3. For each: first do a bloom-range-skip (`max_key`/`min_key`), then bloom `may_contain`, then exact sorted-merge scan (`is_disjoint_writeset`).
 4. For SSI: also check `is_disjoint_readset_bloom` against the current tx's readset.
 
+### Snapshot Persistence (`src/persistence/`)
+
+Full-state snapshot persistence with atomic write protocol:
+
+- **`Persistence`** — facade holding `Arc<Inner>`, snapshot path, mode, compression mode, background thread handle
+- **`SnapshotMode`** — `Never` (manual only) or `Interval(Duration)` (auto periodic)
+- **`PersistenceOptions`** — config DTO: `base_path`, `snapshot_path`, `snapshot_mode`, `compression_mode`
+- **Atomic write protocol** — `tmp → rename → sync_all` three-phase; any crash point leaves old snapshot intact
+- **Streaming serialization** — bincode `encode_into_std_write` / `decode_from_std_read`, O(1) memory per entry
+- **Startup recovery** — `load()` restores datastore from snapshot before spawning GC threads (prevents version GC from eating just-loaded data)
+- **Shutdown order** — snapshot worker stops before GC workers (ensures final snapshot sees complete version chains)
+- **Error taxonomy** — `PersistenceError::Io | Serialization | Deserialization`
+
+### LZ4 Compression (`src/compression/`)
+
+Transparent, optional compression layer for snapshot files:
+
+- **`CompressionMode`** — `None` (default, zero-cost equivalent to raw path) or `Lz4` (level 7 compression)
+- **`CompressedWriter`** — write-side facade; `None` → `BufWriter`, `Lz4` → `Lz4Encoder`; types erased via `Box<dyn Write>`
+- **`CompressedReader`** — read-side facade; auto-detects format by probing LZ4 magic number `0x04224D18` (first 4 bytes of file); backward-compatible with 0.0.6 uncompressed snapshots
+- **Symmetric interface** — `snapshot()` / `load()` code changes only one line each (`BufWriter` → `CompressedWriter`, `BufReader` → `CompressedReader`)
+- **`finish()` method** — explicit flush before `rename`, ensures compressed data fully written to disk
+
+### Persistence Integration
+
+- **`Database::new_with_persistence()`** — construction order: `Inner` → `Persistence::new_with_options` (which calls `load()` + `spawn_snapshot_worker()`) → GC threads → returned
+- **`Database::shutdown()`** — reverse order: snapshot worker → cleanup worker → GC worker
+- **`Persistence::clone()`** — multiple Arc shares one background thread; guarded by `Arc<RwLock<Option<JoinHandle>>>`
+
 ## Progress Convention
 
 | Tag | Section | Status |
@@ -75,8 +106,10 @@ Transaction (writeset) → commit queue (conflict check) → merge queue (pendin
 | `0.0.3` | Runtime hardening (write-path safety, adaptive backoff, Oracle anti-drift) | ✅ done |
 | `0.0.4` | Commit queue GC (active-txn refcount + Dekker double-fence protocol) | ✅ done |
 | `0.0.5` | Version history GC (datastore version-chain compaction, gc_floor + dirty queue + full-scan fallback) | ✅ done |
+| `0.0.6` | Snapshot persistence (bincode full-state snapshot, atomic write protocol, background worker, startup recovery) | ✅ done |
+| `0.0.7` | LZ4 snapshot compression (transparent CompressedWriter/Reader, magic number auto-detect, backward compatible) | ✅ done |
 
-Rough planning: Persistence (WAL/Snapshot).
+Rough planning: WAL incremental log, snapshot format hardening (CRC32, cross-arch).
 
 ## Adding a New Section
 
@@ -90,4 +123,4 @@ Rough planning: Persistence (WAL/Snapshot).
 
 - Diagram labels inside code blocks: **English only**
 - Surrounding prose: Chinese
-- Design docs: `docs/001_basic_transaction.md`, `docs/002_ssi_bloom_filter.md`, `docs/003_runtime_hardening.md`, `docs/004_commit_queue_gc.md`, `docs/005_version_history_gc.md`, etc.
+- Design docs: `docs/001_basic_transaction.md`, `docs/002_ssi_bloom_filter.md`, `docs/003_runtime_hardening.md`, `docs/004_commit_queue_gc.md`, `docs/005_version_history_gc.md`, `docs/006_snapshot.md`, `docs/007_lz4_compression.md`, etc.
