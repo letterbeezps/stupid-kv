@@ -1,6 +1,5 @@
-use std::io::{BufReader, BufWriter, Write};
-use std::thread;
-use std::{thread::JoinHandle};
+use std::io::Write;
+use std::thread::{self, JoinHandle};
 use std::{path::PathBuf};
 use std::{fs::{self, File}};
 use std::{sync::{Arc, atomic::{AtomicBool, Ordering}}};
@@ -9,6 +8,7 @@ use bincode::config;
 use bytes::Bytes;
 use parking_lot::RwLock;
 
+use crate::compression::{CompressedReader, CompressedWriter, CompressionMode};
 use crate::versions::{Version, Versions};
 use crate::{PersistenceOptions, SnapshotMode, db::inner::Inner, error::PersistenceError};
 
@@ -47,6 +47,8 @@ pub struct Persistence {
     /// - `RwLock<Option>`：`spwan_snapshot_worker` 的 `read().is_none()` 判空后
     ///   `write().replace(handle)` 两步插入，保证并发构造 Persistence 时只起一条线程。
     pub(crate) snapshot_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
+
+    pub(crate) compression_mode: CompressionMode,
 }
 
 impl Persistence {
@@ -91,6 +93,7 @@ impl Persistence {
             inner,
             snapshot_path,
             snapshot_mode: options.snapshot_mode,
+            compression_mode: options.compression_mode,
             background_threads_enabled: Arc::new(AtomicBool::new(true)),
             snapshot_handle: Arc::new(RwLock::new(None)),
         };
@@ -123,7 +126,7 @@ impl Persistence {
 
             // BufWriter 包装：8KB 块写入减少 syscall；bincode 的 encode_into_std_write
             // 逐条刷进 BufWriter 内部 buffer，不需要用户手动管理大 buffer。
-            let mut  writer = BufWriter::new(file);
+            let mut  writer = CompressedWriter::new(file, self.compression_mode)?;
 
             // 2. 遍历 datastore 逐条编码
             // - 读锁：entry.value().read()，不阻塞其他事务的读取 / 写入（写入拿写锁，
@@ -143,6 +146,7 @@ impl Persistence {
 
             // 3. 刷 BufWriter → OS PageCache。不 flush 直接 rename 会有数据还在用户态。
             writer.flush()?;
+            writer.finish()?;
 
             // 4. 原子 rename：tmp → final。POSIX 对同文件系统目标的 rename 保证：
             //    要么 final 仍指向旧 inode（旧快照完好），要么指向新 inode（写完整的 tmp），
@@ -185,7 +189,7 @@ impl Persistence {
             let metadata = file.metadata()?;
             if metadata.len() > 0 {
                 // BufReader 对称于写端的 BufWriter：8KB 预读减少 syscall。
-                let mut reader = BufReader::new(file);
+                let mut reader = CompressedReader::new(file)?;
                 let mut count = 0;
                 loop {
                     count += 1;
@@ -267,6 +271,7 @@ impl Persistence {
             // clone Arc<AtomicBool>：线程持有其独立引用，即便 Persistence 被 drop
             // 也能通过该 Arc 读到 false 并退出。
             let enable = self.background_threads_enabled.clone();
+            let compression_mode = self.compression_mode;
             let handle = thread::spawn(move || {
                 while enable.load(Ordering::Acquire) {
                     // park_timeout 同时承担「睡眠 interval」和「可被 unpark 立即唤醒」两个职责。
@@ -284,7 +289,7 @@ impl Persistence {
 
                     let result = || -> Result<(), PersistenceError> {
                         let file = File::create(&temp_path)?;
-                        let mut  writer = BufWriter::new(file);
+                        let mut  writer = CompressedWriter::new(file, compression_mode)?;
 
                         for entry in inner.datastore.iter() {
                             let versions = entry.value().read().all_versions();
@@ -298,6 +303,7 @@ impl Persistence {
                         }
 
                         writer.flush()?;
+                        writer.finish()?;
                         fs::rename(&temp_path, &snapshot_path)?;
                         {
                             let final_file = File::open(&snapshot_path)?;

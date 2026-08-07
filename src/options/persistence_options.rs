@@ -1,5 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
+use crate::compression::CompressionMode;
+
 
 /// 快照触发模式。决定快照文件由谁、在何时写入磁盘。
 #[derive(Debug, Clone, Default, Copy, PartialEq, Eq)]
@@ -51,6 +53,8 @@ pub struct PersistenceOptions {
     /// - `Some(相对路径)`：实际路径 = `{base_path}/{相对路径}`，并保证其父目录被创建
     /// - `Some(绝对路径)`：原样使用，不拼接 base_path，但仍保证父目录存在
     pub snapshot_path: Option<PathBuf>,
+
+    pub compression_mode: CompressionMode,
 }
 
 impl Default for PersistenceOptions {
@@ -59,6 +63,7 @@ impl Default for PersistenceOptions {
             base_path: PathBuf::from("./data"),
             snapshot_mode: SnapshotMode::default(),
             snapshot_path: None,
+            compression_mode: CompressionMode::default(),
         }
     }
 }
@@ -83,6 +88,12 @@ impl PersistenceOptions {
     /// Builder：覆盖快照触发模式。
     pub fn with_snapshot_mode(mut self, snapshot_mode: SnapshotMode) -> Self {
         self.snapshot_mode = snapshot_mode;
+        self
+    }
+
+    /// Builder：覆盖压缩模式。
+    pub fn with_compression_mode(mut self, compression_mode: CompressionMode) -> Self {
+        self.compression_mode = compression_mode;
         self
     }
 }

@@ -44,7 +44,6 @@ flowchart TB
         RUN --> EAC
     end
 
-<!-- APPEND -->
     subgraph SHARED["Shared state (Inner)"]
         MAP["counter_by_commit<br/>SkipMap&lt;u64, Arc&lt;AtomicU64&gt;&gt;"]
         CQ["transaction_commit_queue"]

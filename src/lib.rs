@@ -10,6 +10,8 @@ mod error;
 mod bloom;
 mod options;
 mod persistence;
+mod compression;
+
 
 #[doc(inline)]
 pub use self::db::*;
