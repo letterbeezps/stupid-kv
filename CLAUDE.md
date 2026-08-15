@@ -91,11 +91,27 @@ Transparent, optional compression layer for snapshot files:
 - **Symmetric interface** — `snapshot()` / `load()` code changes only one line each (`BufWriter` → `CompressedWriter`, `BufReader` → `CompressedReader`)
 - **`finish()` method** — explicit flush before `rename`, ensures compressed data fully written to disk
 
+### AOL Incremental Log (`src/persistence/`)
+
+Append-Only Log for reducing crash data loss window from snapshot interval to millisecond level:
+
+- **`AolMode`** — `Never` (disabled, default), `SynchronousOnCommit` (sync write per commit), `AsynchronousAfterCommit` (push to lock-free queue, batch async)
+- **`FsyncMode`** — `Never` (counter only), `EveryAppend` (fsync each batch), `Interval(Duration)` (periodic fsync)
+- **`AsyncAppendOperation`** — struct holding `version` (u64) + `writeset` (BTreeMap<Bytes, Option<Bytes>>) for async dispatch
+- **`append()`** — core method; Sync path uses `Mutex<File>` for linear writes; Async path pushes to `crossbeam_deque::Injector` and wakes `append_worker`
+- **`truncate()`** — called after `snapshot()` completes; copies `[cutoff..file_len)` to tmp, overwrites back; or `set_len(0)` if no new writes
+- **Three workers** — `append_worker` (batch consume from Injector, BATCH_SIZE=100, TIMEOUT=10ms), `fsync_worker` (periodic sync_all when `pending_syncs > 0`), `snapshot_worker` (extended with AOL cutoff + truncate)
+- **`pending_syncs: AtomicU64`** — counter of unsynced AOL data; checked by fsync worker, snapshot truncate, and Drop
+- **`last_fsync: Arc<Mutex<Instant>>`** — shared timestamp between sync append path and async worker path for fsync interval logic
+- **`PersistenceError::LockFailed`** — new variant + `PoisonError` conversion for robust `Mutex<File>` handling
+- **`TxError::TxCommitNotPersisted`** — transaction-level error when AOL write fails, triggers rollback of merge queue and writeset
+
 ### Persistence Integration
 
-- **`Database::new_with_persistence()`** — construction order: `Inner` → `Persistence::new_with_options` (which calls `load()` + `spawn_snapshot_worker()`) → GC threads → returned
-- **`Database::shutdown()`** — reverse order: snapshot worker → cleanup worker → GC worker
+- **`Database::new_with_persistence()`** — construction order: `Inner` → `Persistence::new_with_options` (which calls `load()` + `spawn_snapshot_worker()` + `spawn_appender_worker()` + `spawn_fsync_worker()`) → GC threads → returned
+- **`Database::shutdown()`** — reverse order: snapshot worker → append worker → fsync worker → cleanup worker → GC worker
 - **`Persistence::clone()`** — multiple Arc shares one background thread; guarded by `Arc<RwLock<Option<JoinHandle>>>`
+- **`load()`** — two-phase restore: snapshot restore → AOL replay (CompressedReader + bincode `(key, version, value)` decode, `Versions::push` for each)
 
 ## Progress Convention
 
@@ -108,8 +124,9 @@ Transparent, optional compression layer for snapshot files:
 | `0.0.5` | Version history GC (datastore version-chain compaction, gc_floor + dirty queue + full-scan fallback) | ✅ done |
 | `0.0.6` | Snapshot persistence (bincode full-state snapshot, atomic write protocol, background worker, startup recovery) | ✅ done |
 | `0.0.7` | LZ4 snapshot compression (transparent CompressedWriter/Reader, magic number auto-detect, backward compatible) | ✅ done |
+| `0.0.8` | AOL incremental log (Append-Only Log, AolMode × FsyncMode, crossbeam_deque batch async, snapshot + AOL truncate) | ✅ done |
 
-Rough planning: WAL incremental log, snapshot format hardening (CRC32, cross-arch).
+Rough planning: WAL formalization (checkpoint markers), AOL data integrity (CRC32), log archiving, entry-level compression.
 
 ## Adding a New Section
 

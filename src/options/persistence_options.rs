@@ -212,4 +212,49 @@ impl PersistenceOptions {
         self.compression_mode = compression_mode;
         self
     }
+
+    /// 预设：纯快照模式（最简，零 AOL 开销）。
+    ///
+    /// 仅启用周期性全量快照，不启用 AOL 增量日志。崩溃丢数据窗口 = 快照间隔。
+    /// 适用于可容忍丢数据的缓存层、测试/开发环境。
+    ///
+    /// - `snapshot_interval`：快照间隔（默认 60 秒）
+    /// - AOL：`Never`（不启用）
+    /// - fsync：`Never`（不主动刷盘）
+    pub fn with_pure_snapshot(mut self, snapshot_interval: Duration) -> Self {
+        self.snapshot_mode = SnapshotMode::Interval(snapshot_interval);
+        self.aol_mode = AolMode::Never;
+        self.fsync_mode = FsyncMode::Never;
+        self
+    }
+
+    /// 预设：快照 + AOL 异步批量 + 周期 fsync（性价比最佳，推荐生产默认）。
+    ///
+    /// AOL 以异步批量方式写入，提交线程无磁盘 IO 阻塞；周期性 fsync 兜底，
+    /// 平衡了持久化保证与写入吞吐。
+    ///
+    /// - `snapshot_interval`：快照间隔（默认 30 秒）
+    /// - AOL：`AsynchronousAfterCommit`（后台线程批量消费写入）
+    /// - fsync：`Interval(100ms)`（每 100ms 刷盘一次）
+    pub fn with_async_aol(mut self, snapshot_interval: Duration) -> Self {
+        self.snapshot_mode = SnapshotMode::Interval(snapshot_interval);
+        self.aol_mode = AolMode::AsynchronousAfterCommit;
+        self.fsync_mode = FsyncMode::Interval(Duration::from_millis(100));
+        self
+    }
+
+    /// 预设：快照 + AOL 同步写入 + 每次 fsync（安全性最高）。
+    ///
+    /// 每次事务提交同步写入 AOL 文件并立即 fsync，提交返回后数据已在磁盘。
+    /// 持久化保证最强，但写入吞吐最低。
+    ///
+    /// - `snapshot_interval`：快照间隔（默认 30 秒）
+    /// - AOL：`SynchronousOnCommit`（提交线程同步写入）
+    /// - fsync：`EveryAppend`（每次追加后立即 fsync）
+    pub fn with_sync_aol(mut self, snapshot_interval: Duration) -> Self {
+        self.snapshot_mode = SnapshotMode::Interval(snapshot_interval);
+        self.aol_mode = AolMode::SynchronousOnCommit;
+        self.fsync_mode = FsyncMode::EveryAppend;
+        self
+    }
 }
