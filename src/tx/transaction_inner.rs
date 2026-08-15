@@ -287,6 +287,28 @@ impl TransactionInner {
             // 把写入 key 推入版本 GC 的增量脏队列，供 `run_gc_dirty_inner` 消费
             self.database.gc_dirty_keys.push(key.clone());
         }
+
+        // ---- AOL 持久化阶段 ----
+        // 数据已成功写入 datastore + 合并队列。现在将写集追加到 AOL 文件。
+        // 这是持久化的关键步骤：保证即使 datastore 在后续步骤中丢失（如进程崩溃），
+        // 数据也能从 AOL 日志中恢复。
+        if let Some(p) = self.database.persistence.read().clone() {
+            if let Err(e) = p.append(version, &entry.writeset) {
+                // AOL 写入失败——需要回滚已完成的内存状态：
+                // 1. 从合并队列移除 version（数据已进入 datastore，但合并队列中的
+                //    条目需要在 commit 时被正常清理，否则会残留脏数据）
+                // 2. 清空 readset/readset_bloom（SSI 模式下的读集合）
+                // 3. 清空 writeset（事务状态重置）
+                self.database.transaction_merge_queue.remove(&version);
+                if self.mode >= IsolationLevel::SerializableSnapshotIsolation {
+                    self.readset.pin().clear();
+                    self.readeset_bloom.lock().clear();
+                }
+                self.writeset.clear();
+                return Err(Error::TxCommitNotPersisted(e));
+            }
+        }
+
         // 从合并队列中移除数据，此时数据已经写入数据存储，可以安全地移除，合并队列只存储待提交的数据
         self.database.transaction_merge_queue.remove(&version);
         if self.mode >= IsolationLevel::SerializableSnapshotIsolation {

@@ -144,7 +144,7 @@ mod tests {
 		let res = tx2.commit();
 		assert!(res.is_err());
         
-		assert_eq!(res.unwrap_err(), Error::KeyWriteConflict);
+		assert!(matches!(res.unwrap_err(), Error::KeyWriteConflict));
 
         let mut tx3 = db.transaction(true);
         // tx3 是新的事务，有一个更高的 version, 所以会读取到 tx1 写入的值
@@ -204,7 +204,7 @@ mod tests {
 		let res = tx3.commit();
 		assert!(res.is_err());
         
-		assert_eq!(res.unwrap_err(), Error::KeyWriteConflict);
+		assert!(matches!(res.unwrap_err(), Error::KeyWriteConflict));
 	}
 
     #[test]
