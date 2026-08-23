@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "server"]
+resolver = "2"
+
 [package]
 name = "stupid-kv"
 edition = "2021"

@@ -6,7 +6,7 @@ mod versions;
 mod queue;
 mod oracle;
 mod kv;
-mod error;
+pub mod error;
 mod bloom;
 mod options;
 mod persistence;

@@ -24,6 +24,7 @@
 | [`0.0.6`](https://github.com/letterbeezps/stupid-kv/tree/0.0.6) | Section 0.0.6 — 快照持久化 | 全量快照持久化：`Persistence` 模块 + `SnapshotMode` 配置，`tmp → rename → sync_all` 三段式原子落盘协议，bincode 流式序列化 / 反序列化，后台周期快照线程，`Database::new_with_persistence` 构造 + 三阶段 shutdown 顺序 |
 | [`0.0.7`](https://github.com/letterbeezps/stupid-kv/tree/0.0.7) | Section 0.0.7 — LZ4 快照压缩 | 透明压缩层：`CompressionMode` 两态枚举（None/Lz4），`CompressedWriter` / `CompressedReader` 封装压缩细节，LZ4 level 7 压缩算法，基于 magic number 的自动格式探测，向后兼容 0.0.6 未压缩快照 |
 | [`0.0.8`](https://github.com/letterbeezps/stupid-kv/tree/0.0.8) | Section 0.0.8 — AOL 增量日志 | Append-Only Log 增量持久化：`AolMode` 三态（Never/Sync/Async）、`FsyncMode` 三态（Never/EveryAppend/Interval）、`crossbeam_deque` 无锁异步批量写、`snapshot + AOL truncate` 协同、崩溃恢复窗口从快照间隔缩小到毫秒级 |
+| [`0.0.9`](https://github.com/letterbeezps/stupid-kv/tree/0.0.9) | Section 0.0.9 — Workspace 与 HTTP Server | 项目升级为 Cargo Workspace（lib + server 双 crate），基于 axum 实现 RESTful CRUD API，5 个端点 + 12 个集成测试，`Arc<Database>` 全局唯一实例语义 |
 
 ## 学习笔记
 
@@ -39,6 +40,7 @@
 | 快照持久化 | [006_snapshot.md](docs/006_snapshot.md) | `0.0.6` |
 | LZ4 快照压缩 | [007_lz4_compression.md](docs/007_lz4_compression.md) | `0.0.7` |
 | AOL 增量日志 | [008_aol_module.md](docs/008_aol_module.md) | `0.0.8` |
+| Workspace 与 HTTP Server | [009_workspace_and_http_server.md](docs/009_workspace_and_http_server.md) | `0.0.9` |
 
 ### 番外篇
 
@@ -56,8 +58,34 @@
 - **数据校验**：为 AOL 条目增加 CRC32 校验，让日志文件具备损坏检测能力
 - **快照格式加固**：Magic + Version + CRC32 校验，跨架构可交换
 - **条目级压缩与校验**：AOL 条目级独立压缩/校验，实现单条粒度的损坏隔离
+- **HTTP 持久化配置**：为 Server 启动参数暴露 AOL/Snapshot 配置，让 HTTP API 数据真正持久化到磁盘
+- **多数据库与批量操作**：在 URL 中引入 database namespace，添加 `POST /batch` 批量端点
 
 ## 快速开始
+
+### Lib 模式：作为库嵌入使用
+
+```rust
+use stupid_kv::Database;
+
+fn main() {
+    let db = Database::new();
+
+    // 写入
+    let mut tx = db.transaction(true);
+    tx.set("key1", "value1").unwrap();
+    tx.commit().unwrap();
+
+    // 读取
+    let tx = db.transaction(false);
+    assert_eq!(tx.get("key1").unwrap(), Some("value1".into()));
+
+    // 删除
+    let mut tx = db.transaction(true);
+    tx.del("key1").unwrap();
+    tx.commit().unwrap();
+}
+```
 
 ```bash
 # 运行示例
@@ -66,6 +94,61 @@ cargo run --example 002_ssi
 
 # 运行单元测试
 cargo test
+```
+
+### Bin 模式：启动 HTTP Server
+
+```bash
+# 启动服务（默认监听 http://127.0.0.1:3000）
+cargo run -p server
+```
+
+#### CRUD 接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/{key}` | 读取键值 |
+| GET | `/exists/{key}` | 检查键是否存在 |
+| POST | `/{key}` | 创建键值（已存在返回 409） |
+| PUT | `/{key}` | 创建或更新键值（幂等 upsert） |
+| DELETE | `/{key}` | 删除键值 |
+
+#### curl 示例
+
+```bash
+# 创建键
+curl -X POST http://127.0.0.1:3000/hello \
+  -H 'Content-Type: application/json' \
+  -d '{"value": "world"}'
+# => {"key":"hello","value":"world"}
+
+# 读取键
+curl http://127.0.0.1:3000/hello
+# => {"key":"hello","value":"world"}
+
+# 更新键
+curl -X PUT http://127.0.0.1:3000/hello \
+  -H 'Content-Type: application/json' \
+  -d '{"value": "updated"}'
+# => {"key":"hello","value":"updated"}
+
+# 检查存在
+curl http://127.0.0.1:3000/exists/hello
+# => {"key":"hello","exists":true}
+
+# 删除键
+curl -X DELETE http://127.0.0.1:3000/hello
+# => {"key":"hello","value":"updated"}
+
+# 验证删除
+curl http://127.0.0.1:3000/exists/hello
+# => {"key":"hello","exists":false}
+```
+
+#### 运行 Server 测试
+
+```bash
+cargo test -p server
 ```
 
 ## 架构概览（学习笔记）
@@ -135,6 +218,7 @@ stupid-kv/
 │   ├── compression/    # LZ4 压缩模块（CompressedWriter/Reader + auto-detect）
 │   └── error/          # 错误类型定义（TxError + PersistenceError）
 │   └── lib.rs
+├── server/          # axum HTTP Server（bin crate，提供 CRUD REST API）
 ├── examples/       # 示例代码
 ├── docs/           # 学习笔记
 └── Cargo.toml
