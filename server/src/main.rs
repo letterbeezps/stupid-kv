@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Query, State},
     http::StatusCode,
-    routing::{delete, get, post, put},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,13 @@ struct ErrorResponse {
 }
 
 #[derive(Deserialize)]
+struct KeyQuery {
+    key: String,
+}
+
+#[derive(Deserialize)]
 struct WriteRequest {
+    key: String,
     value: String,
 }
 
@@ -50,8 +56,9 @@ fn map_kv_error(err: KvError) -> (StatusCode, Json<ErrorResponse>) {
 
 async fn get_handler(
     State(db): State<Arc<Database>>,
-    Path(key): Path<String>,
+    Query(params): Query<KeyQuery>,
 ) -> ApiResult<GetResponse> {
+    let key = params.key;
     let tx = db.transaction(false);
     let value = tx.get(&key).map_err(map_kv_error)?;
     Ok(Json(GetResponse {
@@ -62,45 +69,45 @@ async fn get_handler(
 
 async fn exists_handler(
     State(db): State<Arc<Database>>,
-    Path(key): Path<String>,
+    Query(params): Query<KeyQuery>,
 ) -> ApiResult<ExistsResponse> {
+    let key = params.key;
     let tx = db.transaction(false);
     let exists = tx.exists(&key).map_err(map_kv_error)?;
     Ok(Json(ExistsResponse { key, exists }))
 }
 
-async fn post_handler(
+async fn insert_handler(
     State(db): State<Arc<Database>>,
-    Path(key): Path<String>,
     Json(body): Json<WriteRequest>,
 ) -> ApiResult<WriteResponse> {
     let mut tx = db.transaction(true);
-    tx.put(&key, &body.value).map_err(map_kv_error)?;
+    tx.put(&body.key, &body.value).map_err(map_kv_error)?;
     tx.commit().map_err(map_kv_error)?;
     Ok(Json(WriteResponse {
-        key,
+        key: body.key,
         value: body.value,
     }))
 }
 
-async fn put_handler(
+async fn update_handler(
     State(db): State<Arc<Database>>,
-    Path(key): Path<String>,
     Json(body): Json<WriteRequest>,
 ) -> ApiResult<WriteResponse> {
     let mut tx = db.transaction(true);
-    tx.set(&key, &body.value).map_err(map_kv_error)?;
+    tx.set(&body.key, &body.value).map_err(map_kv_error)?;
     tx.commit().map_err(map_kv_error)?;
     Ok(Json(WriteResponse {
-        key,
+        key: body.key,
         value: body.value,
     }))
 }
 
 async fn delete_handler(
     State(db): State<Arc<Database>>,
-    Path(key): Path<String>,
+    Query(params): Query<KeyQuery>,
 ) -> ApiResult<GetResponse> {
+    let key = params.key;
     let mut tx = db.transaction(true);
     let value = tx.get(&key).map_err(map_kv_error)?;
     tx.del(&key).map_err(map_kv_error)?;
@@ -113,24 +120,58 @@ async fn delete_handler(
 
 fn make_app(db: Arc<Database>) -> Router {
     Router::new()
-        .route("/{key}", get(get_handler))
-        .route("/{key}", post(post_handler))
-        .route("/{key}", put(put_handler))
-        .route("/{key}", delete(delete_handler))
-        .route("/exists/{key}", get(exists_handler))
+        .route("/get", get(get_handler))
+        .route("/insert", post(insert_handler))
+        .route("/update", post(update_handler))
+        .route("/delete", delete(delete_handler))
+        .route("/exists", get(exists_handler))
         .with_state(db)
+}
+
+fn parse_port() -> u16 {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" => {
+                if i + 1 < args.len() {
+                    if let Ok(port) = args[i + 1].parse::<u16>() {
+                        return port;
+                    }
+                }
+            }
+            "--help" => {
+                eprintln!("stupid-kv HTTP Server");
+                eprintln!();
+                eprintln!("Usage:");
+                eprintln!("  PORT=<port> cargo run -p server          # via env var (recommended)");
+                eprintln!("  cargo run -p server -- --port <port>     # via CLI arg");
+                eprintln!();
+                eprintln!("Options:");
+                eprintln!("  --port <port>   Set the listening port (default: 3000)");
+                eprintln!("  --help          Print this help message");
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    std::env::var("PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(3000)
 }
 
 #[tokio::main]
 async fn main() {
+    let port = parse_port();
     let db = Arc::new(Database::new());
     let app = make_app(db);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-        .await
-        .unwrap();
+    let addr = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
 
-    println!("stupid-kv server listening on http://127.0.0.1:3000");
+    println!("stupid-kv server listening on http://{addr}");
 
     axum::serve(listener, app).await.unwrap();
 }
@@ -154,7 +195,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_post_create_key_successfully() {
+    async fn test_insert_key_successfully() {
         let app = setup();
 
         let res = app
@@ -162,9 +203,9 @@ mod tests {
             .oneshot(
                 http::Request::builder()
                     .method("POST")
-                    .uri("/hello")
+                    .uri("/insert")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"value":"world"}"#))
+                    .body(Body::from(r#"{"key":"hello","value":"world"}"#))
                     .unwrap(),
             )
             .await
@@ -177,33 +218,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_post_duplicate_key_returns_conflict() {
+    async fn test_insert_duplicate_key_returns_conflict() {
         let app = setup();
 
-        // First create
+        let body = r#"{"key":"dup","value":"first"}"#;
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
                     .method("POST")
-                    .uri("/dup")
+                    .uri("/insert")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"value":"first"}"#))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        // Second create same key should fail
+        let body = r#"{"key":"dup","value":"second"}"#;
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
                     .method("POST")
-                    .uri("/dup")
+                    .uri("/insert")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"value":"second"}"#))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
@@ -215,17 +256,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_put_upsert_non_existing_key() {
+    async fn test_update_non_existing_key() {
         let app = setup();
 
+        let body = r#"{"key":"newkey","value":"newvalue"}"#;
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .method("PUT")
-                    .uri("/newkey")
+                    .method("POST")
+                    .uri("/update")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"value":"newvalue"}"#))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
@@ -236,12 +278,11 @@ mod tests {
         assert_eq!(json["key"], "newkey");
         assert_eq!(json["value"], "newvalue");
 
-        // Verify via GET
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/newkey")
+                    .uri("/get?key=newkey")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -253,32 +294,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_put_update_existing_key() {
+    async fn test_update_existing_key() {
         let app = setup();
 
-        // Create with POST first
+        let body = r#"{"key":"update","value":"v1"}"#;
         let _ = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/insert")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = r#"{"key":"update","value":"v2"}"#;
+        let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
                     .method("POST")
                     .uri("/update")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"value":"v1"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // Update with PUT
-        let res = app
-            .clone()
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/update")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"value":"v2"}"#))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
@@ -288,12 +329,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["value"], "v2");
 
-        // Verify
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/update")
+                    .uri("/get?key=update")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -308,26 +348,25 @@ mod tests {
     async fn test_get_existing_key() {
         let app = setup();
 
-        // Create
+        let body = r#"{"key":"existing","value":"data"}"#;
         let _ = app
             .clone()
             .oneshot(
                 http::Request::builder()
                     .method("POST")
-                    .uri("/existing")
+                    .uri("/insert")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"value":"data"}"#))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
             .unwrap();
 
-        // Get
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/existing")
+                    .uri("/get?key=existing")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -348,7 +387,7 @@ mod tests {
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/nonexistent")
+                    .uri("/get?key=nonexistent")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -365,14 +404,15 @@ mod tests {
     async fn test_exists_true_for_existing_key() {
         let app = setup();
 
+        let body = r#"{"key":"exists_key","value":"check"}"#;
         let _ = app
             .clone()
             .oneshot(
                 http::Request::builder()
                     .method("POST")
-                    .uri("/exists_key")
+                    .uri("/insert")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"value":"check"}"#))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
@@ -382,7 +422,7 @@ mod tests {
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/exists/exists_key")
+                    .uri("/exists?key=exists_key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -403,7 +443,7 @@ mod tests {
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/exists/no_key")
+                    .uri("/exists?key=no_key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -420,27 +460,26 @@ mod tests {
     async fn test_delete_existing_key() {
         let app = setup();
 
-        // Create
+        let body = r#"{"key":"del_key","value":"remove_me"}"#;
         let _ = app
             .clone()
             .oneshot(
                 http::Request::builder()
                     .method("POST")
-                    .uri("/del_key")
+                    .uri("/insert")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"value":"remove_me"}"#))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
             .unwrap();
 
-        // Delete
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
                     .method("DELETE")
-                    .uri("/del_key")
+                    .uri("/delete?key=del_key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -452,12 +491,11 @@ mod tests {
         assert_eq!(json["key"], "del_key");
         assert_eq!(json["value"], "remove_me");
 
-        // Verify deleted
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/del_key")
+                    .uri("/get?key=del_key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -477,7 +515,7 @@ mod tests {
             .oneshot(
                 http::Request::builder()
                     .method("DELETE")
-                    .uri("/no_such_key")
+                    .uri("/delete?key=no_such_key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -494,27 +532,26 @@ mod tests {
     async fn test_full_crud_flow() {
         let app = setup();
 
-        // 1. CREATE with POST
+        let body = r#"{"key":"flow","value":"initial"}"#;
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
                     .method("POST")
-                    .uri("/flow")
+                    .uri("/insert")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"value":"initial"}"#))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        // 2. READ with GET
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/flow")
+                    .uri("/get?key=flow")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -524,27 +561,26 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["value"], "initial");
 
-        // 3. UPDATE with PUT
+        let body = r#"{"key":"flow","value":"updated"}"#;
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .method("PUT")
-                    .uri("/flow")
+                    .method("POST")
+                    .uri("/update")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"value":"updated"}"#))
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        // 4. Read updated value
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/flow")
+                    .uri("/get?key=flow")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -554,12 +590,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["value"], "updated");
 
-        // 5. EXISTS check
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/exists/flow")
+                    .uri("/exists?key=flow")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -569,13 +604,12 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["exists"], true);
 
-        // 6. DELETE
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
                     .method("DELETE")
-                    .uri("/flow")
+                    .uri("/delete?key=flow")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -583,12 +617,11 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        // 7. Verify deleted
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/exists/flow")
+                    .uri("/exists?key=flow")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -602,7 +635,7 @@ mod tests {
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/flow")
+                    .uri("/get?key=flow")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -617,10 +650,10 @@ mod tests {
     async fn test_mixed_keys_isolation() {
         let app = setup();
 
-        // Create multiple keys
         let keys = ["alpha", "beta", "gamma"];
         for key in &keys {
             let body = serde_json::json!({
+                "key": key,
                 "value": format!("val_{}", key)
             });
             let res = app
@@ -628,7 +661,7 @@ mod tests {
                 .oneshot(
                     http::Request::builder()
                         .method("POST")
-                        .uri(format!("/{}", key))
+                        .uri("/insert")
                         .header("content-type", "application/json")
                         .body(Body::from(serde_json::to_string(&body).unwrap()))
                         .unwrap(),
@@ -638,13 +671,12 @@ mod tests {
             assert_eq!(res.status(), StatusCode::OK);
         }
 
-        // Read all keys
         for key in &keys {
             let res = app
                 .clone()
                 .oneshot(
                     http::Request::builder()
-                        .uri(format!("/{}", key))
+                        .uri(format!("/get?key={}", key))
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -655,16 +687,16 @@ mod tests {
             assert_eq!(json["value"], format!("val_{}", key));
         }
 
-        // Update one key
         let body = serde_json::json!({
+            "key": "beta",
             "value": "val_beta_updated"
         });
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .method("PUT")
-                    .uri("/beta")
+                    .method("POST")
+                    .uri("/update")
                     .header("content-type", "application/json")
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap(),
@@ -673,12 +705,11 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
 
-        // Verify other keys unchanged
         let res = app
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/alpha")
+                    .uri("/get?key=alpha")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -692,7 +723,7 @@ mod tests {
             .clone()
             .oneshot(
                 http::Request::builder()
-                    .uri("/beta")
+                    .uri("/get?key=beta")
                     .body(Body::empty())
                     .unwrap(),
             )

@@ -99,49 +99,58 @@ cargo test
 ### Bin 模式：启动 HTTP Server
 
 ```bash
-# 启动服务（默认监听 http://127.0.0.1:3000）
+# 默认端口 3000
 cargo run -p server
+
+# 自定义端口（方式一：环境变量，推荐）
+PORT=8080 cargo run -p server
+
+# 自定义端口（方式二：命令行参数）
+cargo run -p server -- --port 8080
+
+# 查看帮助
+cargo run -p server -- --help
 ```
 
 #### CRUD 接口
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/{key}` | 读取键值 |
-| GET | `/exists/{key}` | 检查键是否存在 |
-| POST | `/{key}` | 创建键值（已存在返回 409） |
-| PUT | `/{key}` | 创建或更新键值（幂等 upsert） |
-| DELETE | `/{key}` | 删除键值 |
+| 方法 | 路径 | 参数 | 说明 |
+|------|------|------|------|
+| GET | `/get` | `key` (query) | 读取键值 |
+| GET | `/exists` | `key` (query) | 检查键是否存在 |
+| POST | `/insert` | `key`, `value` (body) | 创建键值（已存在返回 409） |
+| POST | `/update` | `key`, `value` (body) | 创建或更新键值（幂等 upsert） |
+| DELETE | `/delete` | `key` (query) | 删除键值 |
 
 #### curl 示例
 
 ```bash
 # 创建键
-curl -X POST http://127.0.0.1:3000/hello \
+curl -X POST http://127.0.0.1:3000/insert \
   -H 'Content-Type: application/json' \
-  -d '{"value": "world"}'
+  -d '{"key": "hello", "value": "world"}'
 # => {"key":"hello","value":"world"}
 
 # 读取键
-curl http://127.0.0.1:3000/hello
+curl http://127.0.0.1:3000/get?key=hello
 # => {"key":"hello","value":"world"}
 
 # 更新键
-curl -X PUT http://127.0.0.1:3000/hello \
+curl -X POST http://127.0.0.1:3000/update \
   -H 'Content-Type: application/json' \
-  -d '{"value": "updated"}'
+  -d '{"key": "hello", "value": "updated"}'
 # => {"key":"hello","value":"updated"}
 
 # 检查存在
-curl http://127.0.0.1:3000/exists/hello
+curl http://127.0.0.1:3000/exists?key=hello
 # => {"key":"hello","exists":true}
 
 # 删除键
-curl -X DELETE http://127.0.0.1:3000/hello
+curl -X DELETE http://127.0.0.1:3000/delete?key=hello
 # => {"key":"hello","value":"updated"}
 
 # 验证删除
-curl http://127.0.0.1:3000/exists/hello
+curl http://127.0.0.1:3000/exists?key=hello
 # => {"key":"hello","exists":false}
 ```
 
