@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "stupid-kv-py"
+version = "0.0.10"
+requires-python = ">=3.8"
+description = "Python bindings for stupid-kv, an MVCC key-value database"
+license = { text = "MIT" }
+readme = "../README.md"
+keywords = ["kv", "mvcc", "database", "transaction"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "License :: OSI Approved :: MIT License",
+]
+
+[tool.maturin]
+# maturin auto-detects module name from [lib] name = "stupid_kv"
+features = ["pyo3/extension-module"]

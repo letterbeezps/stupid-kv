@@ -108,6 +108,7 @@ pub enum SnapshotMode {
 ///     .with_snapshot_mode(SnapshotMode::Never)  // 纯手动
 ///     .with_snapshot_path(Some("snapshots/v1.bin".into()));
 /// ```
+#[derive(Clone)]
 pub struct PersistenceOptions {
     /// 数据持久化基础路径。`snapshot_path` 为相对路径 / None 时会拼接在它下面。
     ///

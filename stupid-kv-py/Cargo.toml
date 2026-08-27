@@ -1,0 +1,15 @@
+[package]
+name = "stupid-kv-py"
+version = "0.0.10"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Python bindings for stupid-kv via PyO3"
+
+[lib]
+name = "stupid_kv"
+crate-type = ["cdylib"]
+
+[dependencies]
+stupid-kv = { path = "../" }
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py38"] }

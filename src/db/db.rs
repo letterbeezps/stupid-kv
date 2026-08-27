@@ -7,7 +7,7 @@ use crate::db::inner::Inner;
 use crate::options::{DEFAULT_CLEANUP_INTERVAL, DEFAULT_GC_FULL_SCAN_FREQUENCY, DEFAULT_GC_INTERVAL, DatabaseOptions};
 use crate::persistence::Persistence;
 use crate::pool::{DEFAULT_POOL_SIZE, Pool};
-use crate::tx::{Transaction};
+use crate::tx::Transaction;
 
 
 

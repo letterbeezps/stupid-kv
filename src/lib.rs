@@ -20,3 +20,9 @@ pub use self::db::*;
 
 #[doc(inline)]
 pub use self::options::*;
+
+// Re-export `Transaction` from the private `tx` module so external consumers
+// (e.g. the PyO3 binding in `stupid-kv-py`) can name the type returned by
+// `Database::transaction()`.
+#[doc(inline)]
+pub use self::tx::Transaction;

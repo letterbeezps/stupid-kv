@@ -4,3 +4,12 @@
 *.pdb
 .DS_Store
 .trae
+
+# Python build artifacts (PyO3 / maturin)
+stupid-kv-py/target/
+stupid-kv-py/*.so
+stupid-kv-py/*.pyd
+stupid-kv-py/*.dylib
+__pycache__/
+*.pyc
+.pytest_cache/

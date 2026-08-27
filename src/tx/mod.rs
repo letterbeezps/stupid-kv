@@ -4,4 +4,6 @@ mod transaction;
 
 use isolation::*;
 pub(crate) use transaction_inner::*;
-pub(crate) use transaction::*;
+// Re-export `Transaction` publicly so external consumers (e.g. PyO3 bindings)
+// can name the type returned by `Database::transaction()`.
+pub use transaction::Transaction;
