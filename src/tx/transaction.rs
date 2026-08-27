@@ -1,12 +1,20 @@
+use std::sync::Arc;
+
 use bytes::Bytes;
 
 use crate::kv::IntoBytes;
+use crate::pool::Pool;
 use crate::tx::{TransactionInner, release_counter};
 use crate::error::Error;
 use crate::tx::isolation::IsolationLevel;
 
 
 pub struct Transaction {
+    /// 所属对象池。Transaction::Drop 负责把 inner 回收到这里，
+    /// 而不是让它随 Transaction 一起 drop 掉。
+	pub(crate) pool: Arc<Pool>,
+
+    /// 事务内部状态。None 表示已被 Drop take 走并回收到池。
     pub(crate) inner: Option<TransactionInner>,
 }
 
@@ -23,6 +31,9 @@ impl Drop for Transaction {
 			if release_counter(&inner.counter_version) {
 				inner.database.counter_by_oracle.remove(&inner.version);
 			}
+			// 回收 inner 到对象池，供下次 transaction() 复用。
+			// 池满时 put 会静默丢弃，退化为普通 drop。
+			self.pool.put(inner);
 		}
 	}
 }

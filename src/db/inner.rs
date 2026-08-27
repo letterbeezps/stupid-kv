@@ -114,6 +114,10 @@ pub struct Inner {
     /// - `Option`：纯内存模式下为 None，不分配 Persistence；
     /// - `Arc`：与 Database.persistence 里的值共享同一实例（clone 的是 Arc 引用，不是实例）。
     pub(crate) persistence: RwLock<Option<Arc<Persistence>>>,
+
+    /// 复用阈值：writeset 超过此长度时 reset 整块替换，否则只 clear。
+    /// 用于事务对象池，避免大小事务交替产生 allocator 抖动。
+    pub(crate) reset_threshold: usize,
 }
 
 impl Inner {
@@ -134,6 +138,7 @@ impl Inner {
             datastore: SkipMap::new(),
             background_threads_enabled: AtomicBool::new(true),
             persistence: RwLock::new(None),
+            reset_threshold: opts.reset_threshold,
         }
     }
 }

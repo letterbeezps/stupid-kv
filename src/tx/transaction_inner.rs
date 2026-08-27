@@ -41,6 +41,11 @@ pub(crate) struct TransactionInner {
     pub(crate) writeset: BTreeMap<Bytes, Option<Bytes>>,
     /// 该事务的数据库实例
     pub(crate) database: Arc<Inner>,
+
+    /// 复用阈值：writeset 长度超过此值时，reset 用 `BTreeMap::new()` 整块替换
+    /// （等价于释放旧分配、重新申请），否则只 `clear()` 保留内存——
+    /// 避免高频大小事务交替时产生不必要的 allocator 抖动。
+    reset_threshold: usize,
 }
 
 /// 事务侧向 GC 登记快照：读 atomic → 在 `map[v]` 上 CAS +1 → 返回 `(v, counter)`。
@@ -151,6 +156,7 @@ impl TransactionInner {
         // commit queue GC 不需要 gc_floor 事前检查，传 None。
         let (commit, counter_commit) = register_counter(&db.counter_by_commit, &db.transaction_commit_id, None);
 
+        let reset_threshold = db.reset_threshold;
         Self {
             mode: IsolationLevel::SnapshotIsolation,
             done: false,
@@ -163,7 +169,51 @@ impl TransactionInner {
             readeset_bloom: Mutex::new(BloomFilter::new()),
             writeset: BTreeMap::new(),
             database: db,
+            reset_threshold,
         }
+    }
+
+    /// 重置事务状态为"刚创建"的样子，供对象池复用时调用。
+    ///
+    /// 重置内容：
+    /// - 重新向 counter_by_oracle / counter_by_commit 注册（拿到新 version / commit / counter）；
+    /// - 清空 readset / readset_bloom / writeset；
+    /// - 重置 done=false、mode=SI、write 由调用方指定；
+    /// - writeset 采用条件清理：长度超过 reset_threshold 直接 new 新 BTreeMap，
+    ///   否则 clear 保留底层 buffer，平衡"频繁 clear 的内存碎片"与"重建的分配开销"。
+    ///
+    /// 注意：调用方需先释放旧的 counter（在 Transaction::Drop 里完成），
+    /// 本方法只负责注册新 counter，不负责释放旧的。
+    pub(crate) fn reset(&mut self, write: bool) {
+        self.mode = IsolationLevel::SnapshotIsolation;
+        self.reset_threshold = self.database.reset_threshold;
+        let (version, counter_version) = register_counter(
+            &self.database.counter_by_oracle, 
+            &self.database.oracle.inner.timestamp, 
+            Some(&self.database.gc_floor)
+        );
+
+        let (commit, counter_commit) = register_counter(
+            &self.database.counter_by_commit, 
+            &self.database.transaction_commit_id, 
+            None,
+        );
+
+        let reset_threshold = self.database.reset_threshold;
+        
+        self.readset.pin().clear();
+        self.readeset_bloom.lock().clear();
+
+        match self.writeset.len() > reset_threshold {
+            true => self.writeset = BTreeMap::new(),
+            false => self.writeset.clear(),
+        }
+        self.done = false;
+        self.write = write;
+        self.version = version;
+        self.counter_version = counter_version;
+        self.commit = commit;
+        self.counter_commit = counter_commit;
     }
 
     /// 获取该事务创建时的数据版本号

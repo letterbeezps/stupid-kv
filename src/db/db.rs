@@ -6,12 +6,16 @@ use crate::PersistenceOptions;
 use crate::db::inner::Inner;
 use crate::options::{DEFAULT_CLEANUP_INTERVAL, DEFAULT_GC_FULL_SCAN_FREQUENCY, DEFAULT_GC_INTERVAL, DatabaseOptions};
 use crate::persistence::Persistence;
-use crate::tx::{Transaction, TransactionInner};
+use crate::pool::{DEFAULT_POOL_SIZE, Pool};
+use crate::tx::{Transaction};
 
 
 
 pub struct Database {
     inner: Arc<Inner>,
+
+    /// 事务对象池。复用 TransactionInner，降低频繁创建/销毁开销。
+    pool: Arc<Pool>,
 
 	/// commit queue GC 后台线程扫描周期。
 	cleanup_interval: Duration,
@@ -33,8 +37,11 @@ pub struct Database {
 
 impl Default for Database {
     fn default() -> Self {
+		let inner = Arc::new(Inner::default());
+		let pool = Pool::new(inner.clone(), DEFAULT_POOL_SIZE);
         Self {
-            inner: Arc::new(Inner::default()),
+            inner,
+			pool,
 
 			cleanup_interval: DEFAULT_CLEANUP_INTERVAL,
 
@@ -71,8 +78,11 @@ impl Database {
 	/// 使用自定义选项构造 Database。按 `enable_cleanup` / `enable_gc` 启动两条后台 GC 线程。
 	pub fn new_with_options(opts: DatabaseOptions) -> Self {
 		let inner = Arc::new(Inner::new(&opts));
+		let pool = Pool::new(inner.clone(), DEFAULT_POOL_SIZE);
+		
 		let db = Database {
 			inner,
+			pool,
 			cleanup_interval: opts.cleanup_interval,
 			gc_interval: opts.gc_interval,
 			gc_full_scan_frequency: opts.gc_full_scan_frequency,
@@ -125,8 +135,10 @@ impl Database {
 		// clone 出来的实例共享同一份 snapshot_handle / background_threads_enabled。
 		inner.persistence.write().replace(Arc::new(persist.clone()));
 
+		let pool = Pool::new(inner.clone(), DEFAULT_POOL_SIZE);
 		let db = Database {
 			inner,
+			pool,
 			cleanup_interval: opts.cleanup_interval,
 			gc_interval: opts.gc_interval,
 			gc_full_scan_frequency: opts.gc_full_scan_frequency,
@@ -145,9 +157,10 @@ impl Database {
 		Ok(db)
 	}
 
+    /// 开启一个事务。优先从对象池复用已结束的 TransactionInner，
+    /// 池空时再新建；事务 Drop 时自动回收到池。
     pub fn transaction(&self, write: bool) -> Transaction {
-        let inner = TransactionInner::new(self.inner.clone(), write);
-        Transaction { inner: Some(inner) }
+        self.pool.get(write)
     }
 
 	/// 手动触发一次 commit queue GC，与后台线程共用同一入口。

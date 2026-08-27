@@ -11,6 +11,8 @@ mod bloom;
 mod options;
 mod persistence;
 mod compression;
+mod pool;
+
 
 
 #[doc(inline)]
