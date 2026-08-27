@@ -25,6 +25,7 @@
 | [`0.0.7`](https://github.com/letterbeezps/stupid-kv/tree/0.0.7) | Section 0.0.7 — LZ4 快照压缩 | 透明压缩层：`CompressionMode` 两态枚举（None/Lz4），`CompressedWriter` / `CompressedReader` 封装压缩细节，LZ4 level 7 压缩算法，基于 magic number 的自动格式探测，向后兼容 0.0.6 未压缩快照 |
 | [`0.0.8`](https://github.com/letterbeezps/stupid-kv/tree/0.0.8) | Section 0.0.8 — AOL 增量日志 | Append-Only Log 增量持久化：`AolMode` 三态（Never/Sync/Async）、`FsyncMode` 三态（Never/EveryAppend/Interval）、`crossbeam_deque` 无锁异步批量写、`snapshot + AOL truncate` 协同、崩溃恢复窗口从快照间隔缩小到毫秒级 |
 | [`0.0.9`](https://github.com/letterbeezps/stupid-kv/tree/0.0.9) | Section 0.0.9 — Workspace 与 HTTP Server | 项目升级为 Cargo Workspace（lib + server 双 crate），基于 axum 实现 RESTful CRUD API，5 个端点 + 12 个集成测试，`Arc<Database>` 全局唯一实例语义 |
+| [`0.0.10`](https://github.com/letterbeezps/stupid-kv/tree/0.0.10) | Section 0.0.10 — 事务对象池 | `crossbeam_array_queue` 有界无锁池复用 TransactionInner，`Pool::get()` 命中时 `reset()` 重置状态避免 3 次 heap 分配（HashSet / BloomFilter / BTreeMap），`reset_threshold` 条件清理 writeset 平衡 allocator 抖动，Drop 两段式退场先释放 GC counter 再回收 |
 
 ## 学习笔记
 
@@ -41,6 +42,7 @@
 | LZ4 快照压缩 | [007_lz4_compression.md](docs/007_lz4_compression.md) | `0.0.7` |
 | AOL 增量日志 | [008_aol_module.md](docs/008_aol_module.md) | `0.0.8` |
 | Workspace 与 HTTP Server | [009_workspace_and_http_server.md](docs/009_workspace_and_http_server.md) | `0.0.9` |
+| 事务对象池 | [010_transaction_object_pool.md](docs/010_transaction_object_pool.md) | `0.0.10` |
 
 ### 番外篇
 
@@ -179,6 +181,7 @@ cargo test -p server
                      │  gc worker         ── GC thread      │
                      │  persistence       ── snapshot + AOL│
                      │  compression       ── LZ4           │
+                     │  pool              ── tx pool reuse │
                      └───────────┬──────────────────────────┘
                                  │ shared ref
                                  ▼
@@ -225,8 +228,9 @@ stupid-kv/
 │   ├── options/        # 运行时参数入口 DatabaseOptions + PersistenceOptions
 │   ├── persistence/    # 快照持久化 + AOL 增量日志模块（snapshot/load/后台线程/AOL append/truncate）
 │   ├── compression/    # LZ4 压缩模块（CompressedWriter/Reader + auto-detect）
-│   └── error/          # 错误类型定义（TxError + PersistenceError）
-│   └── lib.rs
+│   ├── pool/           # 事务对象池（crossbeam ArrayQueue 无锁复用 TransactionInner）
+│   ├── error/          # 错误类型定义（TxError + PersistenceError）
+│   └── lib.rs          # crate 根模块（re-export + mod 声明）
 ├── server/          # axum HTTP Server（bin crate，提供 CRUD REST API）
 ├── examples/       # 示例代码
 ├── docs/           # 学习笔记
