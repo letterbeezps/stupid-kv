@@ -19,3 +19,7 @@ classifiers = [
 [tool.maturin]
 # maturin auto-detects module name from [lib] name = "stupid_kv"
 features = ["pyo3/extension-module"]
+
+# PEP 735 dev-dep：`uv sync` 会创建 .venv 并装这里列出的开发依赖
+[dependency-groups]
+dev = ["maturin>=1.0,<2.0"]
