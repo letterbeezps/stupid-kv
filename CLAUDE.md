@@ -12,13 +12,24 @@ Tutorial project: an incremental Rust implementation of an MVCC key-value databa
 
 ## Commands
 
+The repo is a Cargo workspace with two crates: root crate `stupid-kv` (library) and `server/` (binary).
+
 ```bash
-cargo test                          # run all tests
-cargo test <test_name>              # run a single test by name
-cargo test -- --nocapture           # run tests with stdout
-cargo run --example 001_basic       # basic MVCC example
-cargo run --example 002_ssi         # SSI + write-skew example
-cargo build                         # build library
+cargo test                              # run all tests (lib + server)
+cargo test --lib                        # run only library tests
+cargo test -p server                    # run server integration tests
+cargo test <test_name>                  # run a single test by name (across all crates)
+cargo test -p server <test_name>        # run a single server test
+cargo test -- --nocapture               # run tests with stdout
+cargo run --example 001_basic           # basic MVCC example
+cargo run --example 002_ssi             # SSI + write-skew example
+cargo build                             # build library
+
+# HTTP server (server crate) — uses axum
+cargo run -p server                     # default port 3000
+PORT=8080 cargo run -p server           # port via env var (recommended)
+cargo run -p server -- --port 8080      # port via CLI arg
+cargo run -p server -- --help           # print CLI usage
 ```
 
 ## Architecture
@@ -39,13 +50,36 @@ Transaction (writeset) → commit queue (conflict check) → merge queue (pendin
 
 ### Key Structures
 
-- **`Inner`** (`src/db/inner.rs`) — shared state behind `Arc`, holds all queues and the datastore.
-- **`TransactionInner`** (`src/tx/transaction_inner.rs`) — per-transaction state: `commit` (snapshot of commit ID at tx start), `version` (Oracle timestamp at tx start), `writeset`, `readset` (SSI only), `readset_bloom`.
+- **`Inner`** (`src/db/inner.rs`) — shared state behind `Arc`, holds all queues, the datastore, GC refcount maps (`counter_by_commit`, `counter_by_oracle`), `gc_floor` watermark, `gc_dirty_keys` queue, and `Option<Arc<Persistence>>`.
+- **`Database`** (`src/db/db.rs`) — public facade wrapping `Arc<Inner>` + `Arc<Pool>` + GC intervals + optional `Persistence`. Implements `Deref<Target = Inner>` so most callers can treat Database as Inner. `Drop` triggers `shutdown()` to join background workers in safe order.
+- **`TransactionInner`** (`src/tx/transaction_inner.rs`) — per-transaction state: `commit` (snapshot of commit ID at tx start), `version` (Oracle timestamp at tx start), `writeset`, `readset` (SSI only), `readset_bloom`, plus shared `Arc<AtomicU64>` counters registered into `counter_by_commit` / `counter_by_oracle` for GC safety.
+- **`Pool`** (`src/pool/pool.rs`) — bounded lock-free `crossbeam::ArrayQueue` of idle `TransactionInner`s. `Pool::get()` hits → `reset()`; miss → new. Soft cap (overflow drops, doesn't block). Soft cap = `DEFAULT_POOL_SIZE` (512).
 - **`Versions`** (`src/versions/versions.rs`) — sorted `SmallVec<[Version; 4]>` of `(version: u64, value: Option<Bytes>)`. `None` is a tombstone. `fetch_version(v)` returns the newest value with version ≤ v.
 - **`Commit`** (`src/queue/commit.rs`) — writeset snapshot stored in commit queue; carries a `BloomFilter` over write keys and `(min_key, max_key)` for fast range skipping during conflict detection.
 - **`BloomFilter`** (`src/bloom/bloom.rs`) — fixed 512-byte (4096-bit) filter using FNV-1a + Kirsch-Mitzenmacher double hashing (k=3). Used to accelerate conflict detection on both writesets and readsets.
-- **`Persistence`** (`src/persistence/persistence.rs`) — full-state snapshot facade; holds `Arc<Inner>`, snapshot path, mode, compression mode, background thread handles. Provides `snapshot()` manual trigger and `load()` startup recovery.
+- **`Persistence`** (`src/persistence/persistence.rs`) — snapshot + AOL facade; holds `Arc<Inner>`, paths, modes, three background thread handles (snapshot / append / fsync). Recovery is `load()` (snapshot) → AOL replay.
 - **`CompressedWriter` / `CompressedReader`** (`src/compression/compression.rs`) — transparent compression wrappers; auto-detect LZ4 format via magic number `0x04224D18`; types erased through `Box<dyn Write>` / `Box<dyn Read>`.
+- **`Oracle`** (`src/oracle/oracle.rs`) — monotonic nanosecond timestamp allocator; exposes `next_ts()` for write transactions and a background resync thread (Section 0.0.3) that resists wall-clock drift.
+
+## Error Taxonomy
+
+- **`TxError`** (`src/error/tx_error.rs`) — transaction-level errors: write-write conflict (`KeyWriteConflict`), read-write conflict under SSI (`KeyReadConflict`), `KeyAlreadyExists` for `put` on existing key, `TxKeyNotFound` for `del` on missing key, `TxCommitNotPersisted` when AOL write fails (triggers writeset rollback).
+- **`PersistenceError`** (`src/error/persistence_error.rs`) — IO errors (`Io`), bincode failures (`Serialization` / `Deserialization`), `LockFailed` for poisoned `Mutex<File>`. Re-exported as `stupid_kv::error::Error` (the lib's unified error type).
+
+## Server Crate
+
+- **`server/`** — Cargo workspace member, separate binary crate. Provides a thin axum-based REST API over `Arc<Database>`.
+- **Endpoints**: `GET /get`, `GET /exists`, `POST /insert` (409 on duplicate), `POST /update` (idempotent upsert), `DELETE /delete`.
+- **Port**: `PORT` env var (preferred) or `--port` CLI arg, parsed in `parse_port()`; default `3000`.
+- **Error mapping**: `KvError::KeyWriteConflict | KeyReadConflict | KeyAlreadyExists` → HTTP 409; other errors → 500.
+- **Tests**: 12 `#[tokio::test]` cases in `server/src/main.rs` exercise full CRUD + duplicate + isolation flows via `tower::ServiceExt::oneshot` (no real socket).
+
+## Test Organization
+
+- **Library unit tests** live next to code (`#[cfg(test)] mod tests` in each module).
+- **Library integration tests** (`tests/`): `isolations.rs` (SI + SSI semantics), `gc.rs` (commit queue + version history GC), `large_transactions.rs` (writeset scale, pool reuse pressure).
+- **Server integration tests** live inside `server/src/main.rs` (no separate `tests/` dir for the bin crate).
+- Run a single integration test: `cargo test --test isolations <name>` (lib) or `cargo test -p server <name>` (server).
 
 ### Two IDs: `commit` vs `version`
 
@@ -125,8 +159,10 @@ Append-Only Log for reducing crash data loss window from snapshot interval to mi
 | `0.0.6` | Snapshot persistence (bincode full-state snapshot, atomic write protocol, background worker, startup recovery) | ✅ done |
 | `0.0.7` | LZ4 snapshot compression (transparent CompressedWriter/Reader, magic number auto-detect, backward compatible) | ✅ done |
 | `0.0.8` | AOL incremental log (Append-Only Log, AolMode × FsyncMode, crossbeam_deque batch async, snapshot + AOL truncate) | ✅ done |
+| `0.0.9` | Cargo Workspace + HTTP Server (separate `server/` crate with axum, 5 CRUD endpoints, `Arc<Database>` shared instance, port via env/CLI) | ✅ done |
+| `0.0.10` | Transaction Object Pool (`crossbeam::ArrayQueue` bounded lock-free pool, `reset_threshold` to balance allocator churn, two-phase Drop releasing GC counters before pool reuse) | ✅ done |
 
-Rough planning: WAL formalization (checkpoint markers), AOL data integrity (CRC32), log archiving, entry-level compression.
+Rough planning: WAL formalization (checkpoint markers), AOL data integrity (CRC32), log archiving, entry-level compression, HTTP persistence config (expose AOL/snapshot settings to server), multi-database namespace + batch endpoint.
 
 ## Adding a New Section
 
