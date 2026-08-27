@@ -196,7 +196,6 @@ except OSError: ...                       # AOL / IO 失败
 ```
 
 完整可运行示例见 `stupid-kv-py/examples/`（`001_basic.py`、`002_isolation.py`）。
-```
 
 ### Bin 模式：启动 HTTP Server
 
