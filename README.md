@@ -51,6 +51,7 @@
 | 番外 | 笔记文档 | 关联章节 |
 |------|----------|----------|
 | 从测试用例走读隔离级别 | [extras/001_isolation_tests_walkthrough.md](docs/extras/001_isolation_tests_walkthrough.md) | `0.0.1` / `0.0.2` |
+| 用 PyO3 把 stupid-kv 暴露给 Python | [extras/002_python_bindings.md](docs/extras/002_python_bindings.md) | `0.0.10` 补充 |
 
 ### 计划学习的内容
 
@@ -134,6 +135,67 @@ cargo run --example 002_ssi
 
 # 运行单元测试
 cargo test
+```
+
+### Python 模式：原生 Python 调用
+
+通过 PyO3 绑定，可以像 `sqlite3` 一样在 Python 中直接 `import stupid_kv` 使用：
+
+```bash
+# 一次性安装 uv（已装可跳过）
+# macOS / Linux：
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# 或 macOS：
+brew install uv
+
+# 创建 env + 装 maturin + 构建扩展，一条命令搞定
+cd stupid-kv-py
+uv sync                                # 建 .venv + 装 maturin（dev-dep）
+uv run maturin develop --release       # 编译并装到 .venv
+```
+
+之后用 `uv run python` 或 `uv run python examples/001_basic.py` 跑脚本即可，uv 会自动激活环境。
+
+```python
+import stupid_kv
+
+db = stupid_kv.Database()
+
+# 写
+tx = db.transaction(write=True)
+tx.set(b"hello", b"world")
+tx.commit()
+
+# 读（sqlite 风格的 with：正常退出自动 commit，抛异常自动 rollback）
+with db.transaction(write=True) as tx:
+    tx.set(b"k", b"v")
+
+assert db.transaction(write=False).get(b"hello") == b"world"
+```
+
+**API 速览：**
+
+| 类 / 方法 | 说明 |
+|------|------|
+| `stupid_kv.Database()` | 内存数据库；`with_options(opts)` / `with_persistence(opts, persist)` 用于高级配置 |
+| `db.transaction(write: bool)` | 开启事务；支持 `with` 自动 commit / rollback |
+| `tx.set(k, v)` / `tx.put(k, v)` / `tx.delete(k)` | 写操作；`put` 仅在 key 不存在时插入 |
+| `tx.get(k)` / `tx.exists(k)` | 读操作 |
+| `tx.with_snapshot_isolation()` | 切换到 SI（builder 链式） |
+| `tx.with_serializable_snapshot_isolation()` | 切换到 SSI |
+| `tx.commit()` / `tx.cancel()` | 显式提交 / 回滚 |
+
+**异常体系：**
+
+```python
+except stupid_kv.KeyWriteConflict: ...    # 写-写冲突
+except stupid_kv.KeyReadConflict: ...     # SSI 读-写冲突（写倾斜防护）
+except stupid_kv.KeyAlreadyExists: ...    # put 到已存在 key
+except stupid_kv.TxNotWritable: ...       # 只读事务上写
+except OSError: ...                       # AOL / IO 失败
+```
+
+完整可运行示例见 `stupid-kv-py/examples/`（`001_basic.py`、`002_isolation.py`）。
 ```
 
 ### Bin 模式：启动 HTTP Server
