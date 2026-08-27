@@ -5,7 +5,14 @@ resolver = "2"
 [package]
 name = "stupid-kv"
 edition = "2021"
-version = "0.18.1"
+version = "0.0.10"
+description = "An in-memory MVCC key-value database with snapshot persistence, AOL incremental log, LZ4 compression, and an axum HTTP server. A learning project exploring database internals."
+license = "MIT"
+repository = "https://github.com/letterbeezps/stupid-kv"
+readme = "README.md"
+keywords = ["kv", "mvcc", "database", "transaction", "persistence"]
+categories = ["database"]
+documentation = "https://docs.rs/stupid-kv"
 
 [dependencies]
 arc-swap = "1.9.1"

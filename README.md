@@ -63,6 +63,44 @@
 - **HTTP 持久化配置**：为 Server 启动参数暴露 AOL/Snapshot 配置，让 HTTP API 数据真正持久化到磁盘
 - **多数据库与批量操作**：在 URL 中引入 database namespace，添加 `POST /batch` 批量端点
 
+## 安装
+
+由于本项目处于学习阶段，**暂未发布到 crates.io**。如需在外部项目中引用，请通过 **GitHub git 依赖** 引入：
+
+### 在外部项目中使用
+
+```bash
+# 推荐：锁定到具体 tag（可复现，不随 main 漂移）
+cargo add --git https://github.com/letterbeezps/stupid-kv stupid-kv --tag 0.0.10
+```
+
+或手动在 `Cargo.toml` 中添加：
+
+```toml
+[dependencies]
+stupid-kv = { git = "https://github.com/letterbeezps/stupid-kv", tag = "0.0.10" }
+```
+
+可用 tag 列表见 [学习进度](#学习进度) 章节（当前 `0.0.1` ~ `0.0.10`）。也可临时跟踪 main 分支试用最新开发版本：
+
+```toml
+stupid-kv = { git = "https://github.com/letterbeezps/stupid-kv", branch = "main" }
+```
+
+> ⚠️ 本项目仍在持续演进，主分支 API 可能不稳定。生产或长期使用请固定到具体 tag。
+
+### 在本仓库内引用（workspace 模式）
+
+本仓库本身是 Cargo workspace，`server/` 子 crate 通过 path 依赖直接引用根 lib：
+
+```toml
+# server/Cargo.toml
+[dependencies]
+stupid-kv = { path = ".." }
+```
+
+---
+
 ## 快速开始
 
 ### Lib 模式：作为库嵌入使用
