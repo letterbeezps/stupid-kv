@@ -52,6 +52,7 @@
 |------|----------|----------|
 | 从测试用例走读隔离级别 | [extras/001_isolation_tests_walkthrough.md](docs/extras/001_isolation_tests_walkthrough.md) | `0.0.1` / `0.0.2` |
 | 用 PyO3 把 stupid-kv 暴露给 Python | [extras/002_python_bindings.md](docs/extras/002_python_bindings.md) | `0.0.10` 补充 |
+| 用 CGo 把 stupid-kv 暴露给 Go | [extras/003_go_bindings.md](docs/extras/003_go_bindings.md) | `0.0.10` 补充 |
 
 ### 计划学习的内容
 
