@@ -4,6 +4,8 @@
 *.pdb
 .DS_Store
 .trae
+.env
+.venv
 
 # Python build artifacts (PyO3 / maturin)
 stupid-kv-py/target/
