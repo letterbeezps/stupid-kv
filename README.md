@@ -197,6 +197,73 @@ except OSError: ...                       # AOL / IO 失败
 
 完整可运行示例见 `stupid-kv-py/examples/`（`001_basic.py`、`002_isolation.py`）。
 
+### Go 模式：原生 Go 调用
+
+通过 CGo + Rust FFI（C ABI），可以像嵌入库一样在 Go 中直接 `import stupidkv` 使用。Go 绑定由两部分组成：
+
+- [`stupid-kv-c/`](stupid-kv-c/) — Rust 侧的 C ABI crate，编译为 cdylib（附带头文件 `stupid-kv-c/include/stupid_kv.h`）
+- [`stupid-kv-go/`](stupid-kv-go/) — Go 模块，通过 cgo 链接上述动态库
+
+```bash
+# 1. 构建 Rust cdylib 并拷贝到 stupid-kv-go/lib/（首次必做）
+cd stupid-kv-go && make lib
+
+# 2. 运行测试 / 示例
+make test
+make example
+```
+
+之后在代码中导入使用：
+
+```go
+package main
+
+import stupidkv "github.com/letterbeezps/stupid-kv/stupid-kv-go"
+
+func main() {
+    db := stupidkv.New()
+    defer db.Close()
+
+    // 写
+    tx := db.Transaction(true)
+    tx.Set([]byte("hello"), []byte("world"))
+    tx.Commit()
+
+    // 读
+    rtx := db.Transaction(false)
+    v, _ := rtx.Get([]byte("hello")) // []byte("world")
+    _ = v
+    rtx.Close()
+}
+```
+
+**API 速览：**
+
+| 类型 / 方法 | 说明 |
+|------|------|
+| `stupidkv.New()` / `NewWithOptions(opts)` | 内存数据库 |
+| `NewWithPersistence(opts, popts)` | 启用快照 + AOL 持久化（IO 失败返回 error） |
+| `db.Transaction(write bool)` | 开启事务（true 读写 / false 只读） |
+| `db.Snapshot()` | 手动触发全量快照落盘 |
+| `tx.Get(k)` / `tx.Exists(k)` | 读操作；key 不存在时 Get 返回 `(nil, nil)` |
+| `tx.Set(k, v)` / `tx.Put(k, v)` / `tx.Delete(k)` | 写操作；`Put` 仅在 key 不存在时插入 |
+| `tx.WithSnapshotIsolation()` / `tx.WithSerializableSnapshotIsolation()` | 切换隔离级别（链式） |
+| `tx.Commit()` / `tx.Cancel()` | 显式提交 / 回滚 |
+| `tx.Version()` / `tx.Closed()` | 事务元信息 |
+| `db.Close()` / `tx.Close()` | 释放句柄（tx 忘记 Close 时由 finalizer 兜底自动 cancel） |
+
+**错误体系：** 全部 sentinel error，配合 `errors.Is` 使用：
+
+```go
+errors.Is(err, stupidkv.ErrWriteConflict)     // 写-写冲突
+errors.Is(err, stupidkv.ErrReadConflict)      // SSI 读-写冲突（写倾斜防护）
+errors.Is(err, stupidkv.ErrKeyAlreadyExists)  // put 到已存在 key
+errors.Is(err, stupidkv.ErrTxNotWritable)     // 只读事务上写
+errors.Is(err, stupidkv.ErrTxClosed)          // 已关闭事务
+```
+
+完整可运行示例见 `stupid-kv-go/examples/`（`001_basic`、`002_ssi`），测试见 `stupid-kv-go/stupidkv_test.go`。
+
 ### Bin 模式：启动 HTTP Server
 
 ```bash
@@ -331,6 +398,9 @@ stupid-kv/
 │   ├── error/          # 错误类型定义（TxError + PersistenceError）
 │   └── lib.rs          # crate 根模块（re-export + mod 声明）
 ├── server/          # axum HTTP Server（bin crate，提供 CRUD REST API）
+├── stupid-kv-py/    # Python 绑定（PyO3，maturin 构建）
+├── stupid-kv-c/     # C ABI FFI 绑定（cdylib + 头文件，供 Go 绑定链接）
+├── stupid-kv-go/    # Go 绑定（CGo 链接 stupid-kv-c，含测试与示例）
 ├── examples/       # 示例代码
 ├── docs/           # 学习笔记
 └── Cargo.toml

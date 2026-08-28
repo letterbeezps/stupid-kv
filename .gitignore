@@ -15,3 +15,6 @@ stupid-kv-py/*.dylib
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Go bindings build artifacts (copied cdylib)
+stupid-kv-go/lib/

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "server", "stupid-kv-py"]
+members = [".", "server", "stupid-kv-py", "stupid-kv-c"]
 resolver = "2"
 
 [package]

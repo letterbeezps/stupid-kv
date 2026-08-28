@@ -21,6 +21,10 @@ pub use self::db::*;
 #[doc(inline)]
 pub use self::options::*;
 
+// `PersistenceOptions.compression_mode` is a public field, so the type must
+// be nameable by external consumers (FFI bindings, bindings tests, ...).
+pub use self::compression::CompressionMode;
+
 // Re-export `Transaction` from the private `tx` module so external consumers
 // (e.g. the PyO3 binding in `stupid-kv-py`) can name the type returned by
 // `Database::transaction()`.

@@ -177,6 +177,15 @@ impl Database {
 		self.run_gc_full(cleanup_ts);
 	}
 
+	/// 手动触发一次全量快照落盘（与后台 snapshot worker 使用同一套
+	/// tmp → rename → sync_all 原子协议）。未启用持久化时返回 Ok(())。
+	pub fn snapshot(&self) -> std::result::Result<(), crate::error::PersistenceError> {
+		match &self.persistence {
+			Some(p) => p.snapshot(),
+			None => Ok(()),
+		}
+	}
+
 	/// 关停所有后台线程：
 	///
 	/// # 顺序（先关读线程再关写线程）
